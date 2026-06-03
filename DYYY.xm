@@ -6457,48 +6457,51 @@ static Class tabBarButtonClass = nil;
     BOOL hideFri = DYYYGetBool(@"DYYYHideFriendsButton");
     BOOL hideMe = DYYYGetBool(@"DYYYHideMyButton");
     BOOL isPad = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
+    BOOL needsButtonRelayout = hideShop || hideMsg || hideFri || hideMe || isPad;
 
-    NSMutableArray *visibleButtons = [NSMutableArray array];
-    UIView *ipadContainerView = nil;
+    if (needsButtonRelayout) {
+        NSMutableArray *visibleButtons = [NSMutableArray array];
+        UIView *ipadContainerView = nil;
 
-    for (UIView *subview in self.subviews) {
-        if ([subview isKindOfClass:generalButtonClass] || [subview isKindOfClass:plusButtonClass]) {
-            NSString *label = subview.accessibilityLabel;
-            BOOL shouldHide = ([label containsString:@"商城"] && hideShop) || ([label containsString:@"消息"] && hideMsg) || ([label containsString:@"朋友"] && hideFri) ||
-                              ([label isEqualToString:@"我"] && hideMe);
+        for (UIView *subview in self.subviews) {
+            if ([subview isKindOfClass:generalButtonClass] || [subview isKindOfClass:plusButtonClass]) {
+                NSString *label = subview.accessibilityLabel;
+                BOOL shouldHide = ([label containsString:@"商城"] && hideShop) || ([label containsString:@"消息"] && hideMsg) || ([label containsString:@"朋友"] && hideFri) ||
+                                  ([label isEqualToString:@"我"] && hideMe);
 
-            subview.userInteractionEnabled = !shouldHide;
-            subview.hidden = shouldHide;
+                subview.userInteractionEnabled = !shouldHide;
+                subview.hidden = shouldHide;
 
-            if (!shouldHide) {
-                [visibleButtons addObject:subview];
+                if (!shouldHide) {
+                    [visibleButtons addObject:subview];
+                }
+            } else if ([subview isKindOfClass:tabBarButtonClass]) {
+                subview.userInteractionEnabled = NO;
+                subview.hidden = YES;
+            } else if (isPad && !ipadContainerView && [subview isMemberOfClass:UIView.class] && fabs(subview.frame.size.width - self.bounds.size.width) > 0.1) {
+                ipadContainerView = subview;
             }
-        } else if ([subview isKindOfClass:tabBarButtonClass]) {
-            subview.userInteractionEnabled = NO;
-            subview.hidden = YES;
-        } else if (isPad && !ipadContainerView && [subview isMemberOfClass:UIView.class] && fabs(subview.frame.size.width - self.bounds.size.width) > 0.1) {
-            ipadContainerView = subview;
         }
-    }
 
-    [visibleButtons sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
-      return [@(a.frame.origin.x) compare:@(b.frame.origin.x)];
-    }];
+        [visibleButtons sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+          return [@(a.frame.origin.x) compare:@(b.frame.origin.x)];
+        }];
 
-    CGFloat offsetX, totalWidth;
-    if (ipadContainerView) {
-        offsetX = ipadContainerView.frame.origin.x;
-        totalWidth = ipadContainerView.bounds.size.width;
-    } else {
-        offsetX = 0;
-        totalWidth = self.bounds.size.width;
-    }
-    CGFloat buttonWidth = (visibleButtons.count > 0) ? (totalWidth / visibleButtons.count) : 0;
+        CGFloat offsetX, totalWidth;
+        if (ipadContainerView) {
+            offsetX = ipadContainerView.frame.origin.x;
+            totalWidth = ipadContainerView.bounds.size.width;
+        } else {
+            offsetX = 0;
+            totalWidth = self.bounds.size.width;
+        }
+        CGFloat buttonWidth = (visibleButtons.count > 0) ? (totalWidth / visibleButtons.count) : 0;
 
-    // 均匀布局按钮
-    for (NSInteger i = 0; i < visibleButtons.count; i++) {
-        UIView *button = visibleButtons[i];
-        button.frame = CGRectMake(offsetX + i * buttonWidth, button.frame.origin.y, buttonWidth, button.frame.size.height);
+        // 均匀布局按钮
+        for (NSInteger i = 0; i < visibleButtons.count; i++) {
+            UIView *button = visibleButtons[i];
+            button.frame = CGRectMake(offsetX + i * buttonWidth, button.frame.origin.y, buttonWidth, button.frame.size.height);
+        }
     }
 
     // 禁用首页刷新功能
@@ -7683,15 +7686,6 @@ static Class tabBarButtonClass = nil;
         CGRect frame = self.frame;
         frame.size.height = self.superview.frame.size.height;
         self.frame = frame;
-    } else if (gCurrentTabBarHeight > 0) {
-        UIWindow *keyWindow = [DYYYUtils getActiveWindow];
-        if (keyWindow && keyWindow.safeAreaInsets.bottom == 0) {
-            return;
-        }
-
-        CGRect frame = self.frame;
-        frame.size.height = self.superview.frame.size.height - gCurrentTabBarHeight;
-        self.frame = frame;
     }
 }
 %end
@@ -8042,8 +8036,11 @@ static Class TagViewClass = nil;
     if ([viewController isKindOfClass:%c(AWELiveNewPreStreamViewController)]) {
         const BOOL shouldShiftUp = DYYYGetBool(@"DYYYEnableFullScreen");
         const CGFloat labelScaleValue = DYYYGetFloat(@"DYYYNicknameScale");
-        const CGFloat targetLabelScale = (labelScaleValue != 0.0) ? MAX(0.01, labelScaleValue) : 1.0;
         const CGFloat elementScaleValue = DYYYGetFloat(@"DYYYElementScale");
+        if (!shouldShiftUp && labelScaleValue == 0.0 && elementScaleValue == 0.0) {
+            return;
+        }
+        const CGFloat targetLabelScale = (labelScaleValue != 0.0) ? MAX(0.01, labelScaleValue) : 1.0;
         const CGFloat targetElementScale = (elementScaleValue != 0.0) ? MAX(0.01, elementScaleValue) : 1.0;
 
         CGAffineTransform targetTransform = CGAffineTransformIdentity;
@@ -8256,8 +8253,11 @@ static Class TagViewClass = nil;
     if ([viewController isKindOfClass:%c(AWELiveNewPreStreamViewController)]) {
         const BOOL shouldShiftUp = DYYYGetBool(@"DYYYEnableFullScreen");
         const CGFloat labelScaleValue = DYYYGetFloat(@"DYYYNicknameScale");
-        const CGFloat targetLabelScale = (labelScaleValue != 0.0) ? MAX(0.01, labelScaleValue) : 1.0;
         const CGFloat elementScaleValue = DYYYGetFloat(@"DYYYElementScale");
+        if (!shouldShiftUp && labelScaleValue == 0.0 && elementScaleValue == 0.0) {
+            return;
+        }
+        const CGFloat targetLabelScale = (labelScaleValue != 0.0) ? MAX(0.01, labelScaleValue) : 1.0;
         const CGFloat targetElementScale = (elementScaleValue != 0.0) ? MAX(0.01, elementScaleValue) : 1.0;
 
         CGAffineTransform targetTransform = CGAffineTransformIdentity;
