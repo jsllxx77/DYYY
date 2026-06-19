@@ -10,6 +10,7 @@
 @property(nonatomic, strong) NSTimer *statusCheckTimer;
 @property(nonatomic, strong) NSTimer *fadeTimer;
 @property(nonatomic, assign) CGFloat originalAlpha;
++ (void)reloadConfiguration;
 - (void)saveButtonPosition;
 - (void)loadSavedPosition;
 - (void)resetButtonState;
@@ -39,8 +40,11 @@ extern NSArray *findViewControllersInHierarchy(UIViewController *rootViewControl
 extern float getCurrentSpeed(void);
 extern NSInteger getCurrentSpeedIndex(void);
 extern void setCurrentSpeedIndex(NSInteger index);
+extern BOOL setCurrentSpeedValue(float speed);
 extern void updateSpeedButtonUI(void);
 extern void updateSpeedButtonVisibility(void);
+extern id DYYYCurrentSpeedInteractionController(void);
+extern void DYYYRefreshFloatSpeedButton(void);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,7 @@
 #import "AwemeHeaders.h"
 #import "DYYYManager.h"
 #import <MobileCoreServices/MobileCoreServices.h>
+#import <math.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
@@ -14,6 +15,8 @@
 #import "DYYYOptionsSelectionView.h"
 
 #import "DYYYConstants.h"
+#import "DYYYFloatClearButton.h"
+#import "DYYYFloatSpeedButton.h"
 #import "DYYYSettingsHelper.h"
 #import "DYYYUtils.h"
 
@@ -34,6 +37,112 @@ void *kViewModelKey = &kViewModelKey;
 static id dyyyRemoteConfigChangedToken = nil;
 static char kDYYYWeatherViewGestureInstalledKey;
 static char kDYYYWeatherSubviewGestureInstalledKey;
+static char kDYYYSettingsSearchCoordinatorKey;
+static BOOL DYYYBuildingSettingsSearchIndex = NO;
+static BOOL DYYYSettingsSearchIndexBuilt = NO;
+static NSString *const kDYYYFeedNowPlayingSettingTitle = @"屏蔽灵动岛抖音播放信息";
+static NSString *const kDYYYFeedNowPlayingSettingIdentifier = @"DYYYDisableFeedNowPlayingInfo";
+static NSString *const kDYYYFeedNowPlayingSVGIconName = @"ic_liveactivityplayslash_outlined_20";
+
+static UIImage *DYYYFeedNowPlayingSVGIcon(CGSize requestedSize) {
+    CGSize targetSize = requestedSize;
+    if (targetSize.width <= 0 || targetSize.height <= 0) {
+        targetSize = CGSizeMake(20, 20);
+    }
+
+    static NSCache<NSString *, UIImage *> *imageCache;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+      imageCache = [[NSCache alloc] init];
+    });
+
+    NSString *cacheKey = NSStringFromCGSize(targetSize);
+    UIImage *cachedImage = [imageCache objectForKey:cacheKey];
+    if (cachedImage) {
+        return cachedImage;
+    }
+
+    UIGraphicsBeginImageContextWithOptions(targetSize, NO, 0);
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    if (!context) {
+        UIGraphicsEndImageContext();
+        return nil;
+    }
+
+    CGContextScaleCTM(context, targetSize.width / 20.0, targetSize.height / 20.0);
+    UIColor *iconColor = [UIColor colorWithRed:22.0 / 255.0 green:24.0 / 255.0 blue:35.0 / 255.0 alpha:1.0];
+    [iconColor setFill];
+    [iconColor setStroke];
+
+    UIBezierPath *capsule = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(1.25, 5.25, 17.5, 9.5) cornerRadius:4.7];
+    [capsule appendPath:[UIBezierPath bezierPathWithRoundedRect:CGRectMake(2.75, 6.75, 14.5, 6.5) cornerRadius:3.2]];
+    capsule.usesEvenOddFillRule = YES;
+    [capsule fill];
+
+    UIBezierPath *play = [UIBezierPath bezierPath];
+    [play moveToPoint:CGPointMake(8.05, 7.438)];
+    [play addCurveToPoint:CGPointMake(8.95682, 6.93014)
+            controlPoint1:CGPointMake(8.05, 6.97219)
+            controlPoint2:CGPointMake(8.55983, 6.68648)];
+    [play addLineToPoint:CGPointMake(13.2548, 9.56814)];
+    [play addCurveToPoint:CGPointMake(13.2548, 10.4319)
+            controlPoint1:CGPointMake(13.6332, 9.80046)
+            controlPoint2:CGPointMake(13.6332, 10.1995)];
+    [play addLineToPoint:CGPointMake(8.95682, 13.0699)];
+    [play addCurveToPoint:CGPointMake(8.05, 12.562)
+            controlPoint1:CGPointMake(8.55983, 13.3135)
+            controlPoint2:CGPointMake(8.05, 13.0278)];
+    [play closePath];
+    [play fill];
+
+    CGContextSetBlendMode(context, kCGBlendModeClear);
+    CGContextSetLineCap(context, kCGLineCapRound);
+    CGContextSetLineWidth(context, 2.35);
+    CGContextMoveToPoint(context, 3.6, 2.65);
+    CGContextAddLineToPoint(context, 16.4, 17.35);
+    CGContextStrokePath(context);
+
+    CGContextSetBlendMode(context, kCGBlendModeNormal);
+    CGContextSetStrokeColorWithColor(context, iconColor.CGColor);
+    CGContextSetLineWidth(context, 1.5);
+    CGContextMoveToPoint(context, 3.6, 2.65);
+    CGContextAddLineToPoint(context, 16.4, 17.35);
+    CGContextStrokePath(context);
+
+    UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    if (image) {
+        [imageCache setObject:image forKey:cacheKey];
+    }
+    return image;
+}
+
+@interface AWESettingsTableViewCell : UITableViewCell
+@property(nonatomic, strong) AWESettingItemModel *itemModel;
+@property(nonatomic, strong) UILabel *titleLabel;
+@property(nonatomic, strong) UIImageView *iconImageView;
+- (void)updateSubviews;
+- (void)updateSubviewsAfterLayout;
+@end
+
+static void DYYYApplyFeedNowPlayingIconToCell(AWESettingsTableViewCell *cell) {
+    AWESettingItemModel *itemModel = cell.itemModel;
+    if (![itemModel.identifier isEqualToString:kDYYYFeedNowPlayingSettingIdentifier]) {
+        return;
+    }
+
+    UIImageView *iconView = cell.iconImageView;
+    if (!iconView) {
+        return;
+    }
+
+    iconView.image = DYYYFeedNowPlayingSVGIcon(iconView.bounds.size);
+    iconView.contentMode = UIViewContentModeScaleAspectFit;
+    iconView.hidden = NO;
+    iconView.alpha = 1.0;
+    iconView.tintColor = cell.titleLabel.textColor;
+}
 
 static void DYYYRemoveRemoteConfigObserver(void) {
     if (dyyyRemoteConfigChangedToken) {
@@ -41,6 +150,461 @@ static void DYYYRemoveRemoteConfigObserver(void) {
         dyyyRemoteConfigChangedToken = nil;
     }
 }
+
+static NSString *DYYYStringOrEmpty(id value) {
+    return [value isKindOfClass:[NSString class]] ? (NSString *)value : @"";
+}
+
+static NSMutableDictionary<NSString *, NSMutableDictionary *> *DYYYSettingsSearchIndexMap(void) {
+    static NSMutableDictionary<NSString *, NSMutableDictionary *> *map = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+      map = [NSMutableDictionary dictionary];
+    });
+    return map;
+}
+
+static NSMutableArray<NSString *> *DYYYSettingsSearchIndexKeys(void) {
+    static NSMutableArray<NSString *> *keys = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+      keys = [NSMutableArray array];
+    });
+    return keys;
+}
+
+static void DYYYRegisterSearchSections(NSString *categoryTitle, NSArray *sections) {
+    if (categoryTitle.length == 0 || sections.count == 0) {
+        return;
+    }
+
+    NSMutableDictionary *indexMap = DYYYSettingsSearchIndexMap();
+    NSMutableArray *orderedKeys = DYYYSettingsSearchIndexKeys();
+
+    for (AWESettingSectionModel *section in sections) {
+        if (![section respondsToSelector:@selector(itemArray)]) {
+            continue;
+        }
+
+        NSString *sectionTitle = DYYYStringOrEmpty(section.sectionHeaderTitle);
+        NSString *path = sectionTitle.length > 0 ? [NSString stringWithFormat:@"%@ - %@", categoryTitle, sectionTitle] : categoryTitle;
+
+        for (id itemObject in section.itemArray) {
+            if (![itemObject isKindOfClass:NSClassFromString(@"AWESettingItemModel")]) {
+                continue;
+            }
+
+            AWESettingItemModel *item = (AWESettingItemModel *)itemObject;
+            if (item.title.length == 0) {
+                continue;
+            }
+
+            NSString *identifier = item.identifier.length > 0 ? item.identifier : item.title;
+            NSString *entryKey = [NSString stringWithFormat:@"%@|%@|%@", path, identifier, item.title];
+            NSString *searchableText = [NSString stringWithFormat:@"%@ %@", item.title ?: @"", item.subTitle ?: @""];
+
+            if (!indexMap[entryKey]) {
+                [orderedKeys addObject:entryKey];
+            }
+            indexMap[entryKey] = [@{@"path" : path, @"item" : item, @"searchableText" : searchableText} mutableCopy];
+        }
+    }
+}
+
+static NSArray<NSDictionary *> *DYYYSettingsSearchEntries(void) {
+    NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
+    NSDictionary *indexMap = DYYYSettingsSearchIndexMap();
+    for (NSString *key in DYYYSettingsSearchIndexKeys()) {
+        NSDictionary *entry = indexMap[key];
+        if (entry) {
+            [entries addObject:entry];
+        }
+    }
+    return entries;
+}
+
+static void DYYYResetSettingsSearchIndex(void) {
+    [DYYYSettingsSearchIndexMap() removeAllObjects];
+    [DYYYSettingsSearchIndexKeys() removeAllObjects];
+    DYYYSettingsSearchIndexBuilt = NO;
+}
+
+static void DYYYRefreshSearchItemValue(AWESettingItemModel *item) {
+    if (item.identifier.length == 0) {
+        return;
+    }
+
+    id savedValue = [[NSUserDefaults standardUserDefaults] objectForKey:item.identifier];
+    if (item.cellType == 6 || item.cellType == 37) {
+        item.isSwitchOn = [savedValue respondsToSelector:@selector(boolValue)] ? [savedValue boolValue] : NO;
+    } else if (savedValue) {
+        if ([savedValue isKindOfClass:[NSString class]]) {
+            item.detail = savedValue;
+        } else if ([savedValue respondsToSelector:@selector(stringValue)]) {
+            item.detail = [savedValue stringValue];
+        }
+    }
+
+    [DYYYSettingsHelper applyDependencyRulesForItem:item];
+}
+
+@interface DYYYSettingsSearchCoordinator : NSObject <UITextFieldDelegate, UIGestureRecognizerDelegate>
+@property(nonatomic, weak) AWESettingBaseViewController *settingsVC;
+@property(nonatomic, weak) UINavigationController *navigationController;
+@property(nonatomic, weak) id<UIGestureRecognizerDelegate> previousInteractivePopGestureDelegate;
+@property(nonatomic, assign) BOOL previousInteractivePopGestureEnabled;
+@property(nonatomic, assign) BOOL hasStoredInteractivePopGestureEnabled;
+@property(nonatomic, strong) AWESettingsViewModel *viewModel;
+@property(nonatomic, copy) NSArray *originalSections;
+@property(nonatomic, copy) NSArray<NSDictionary *> *searchEntries;
+@property(nonatomic, strong) UIView *headerView;
+@property(nonatomic, strong) UIView *containerView;
+@property(nonatomic, strong) UITextField *searchTextField;
+@property(nonatomic, strong) UIScreenEdgePanGestureRecognizer *searchBackGestureRecognizer;
+@property(nonatomic, strong) UIView *centerPlaceholderView;
+@property(nonatomic, strong) UIImageView *centerIconView;
+@property(nonatomic, strong) UILabel *centerPlaceholderLabel;
+- (instancetype)initWithSettingsVC:(AWESettingBaseViewController *)settingsVC viewModel:(AWESettingsViewModel *)viewModel originalSections:(NSArray *)sections searchEntries:(NSArray<NSDictionary *> *)entries;
+- (void)installSearchHeader;
+- (void)installNavigationInterceptors;
+- (void)updateLayout;
+- (void)updateNavigationGestureState;
+- (void)restoreNavigationGestureState;
+- (BOOL)handleBackNavigationRequest;
+@end
+
+@implementation DYYYSettingsSearchCoordinator
+
+- (instancetype)initWithSettingsVC:(AWESettingBaseViewController *)settingsVC viewModel:(AWESettingsViewModel *)viewModel originalSections:(NSArray *)sections searchEntries:(NSArray<NSDictionary *> *)entries {
+    self = [super init];
+    if (self) {
+        _settingsVC = settingsVC;
+        _viewModel = viewModel;
+        _originalSections = [sections copy];
+        _searchEntries = [entries copy];
+    }
+    return self;
+}
+
+- (void)installSearchHeader {
+    [self.settingsVC view];
+    UITableView *tableView = self.settingsVC.tableView;
+    if (!tableView) {
+        return;
+    }
+
+    self.headerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, tableView.bounds.size.width, 64)];
+    self.headerView.backgroundColor = [UIColor clearColor];
+    self.headerView.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+
+    self.containerView = [[UIView alloc] initWithFrame:CGRectMake(16, 8, self.headerView.bounds.size.width - 32, 44)];
+    self.containerView.backgroundColor = [UIColor whiteColor];
+    self.containerView.layer.cornerRadius = 12;
+    self.containerView.layer.masksToBounds = YES;
+    self.containerView.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.headerView addSubview:self.containerView];
+
+    self.searchTextField = [[UITextField alloc] initWithFrame:self.containerView.bounds];
+    self.searchTextField.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.searchTextField.backgroundColor = [UIColor clearColor];
+    self.searchTextField.textColor = [UIColor colorWithRed:22.0 / 255.0 green:24.0 / 255.0 blue:35.0 / 255.0 alpha:1.0];
+    self.searchTextField.tintColor = self.searchTextField.textColor;
+    self.searchTextField.font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
+    self.searchTextField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    self.searchTextField.returnKeyType = UIReturnKeySearch;
+    self.searchTextField.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.searchTextField.spellCheckingType = UITextSpellCheckingTypeNo;
+    self.searchTextField.delegate = self;
+    self.searchTextField.accessibilityLabel = @"DYYY设置搜索";
+
+    UIView *leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 38, 30)];
+    UIImageView *leftIconView = [[UIImageView alloc] initWithFrame:CGRectMake(14, 5, 18, 18)];
+    leftIconView.image = [UIImage systemImageNamed:@"magnifyingglass"];
+    leftIconView.tintColor = [UIColor colorWithWhite:0 alpha:0.38];
+    leftIconView.contentMode = UIViewContentModeScaleAspectFit;
+    [leftView addSubview:leftIconView];
+    self.searchTextField.leftView = leftView;
+    self.searchTextField.leftViewMode = UITextFieldViewModeNever;
+    [self.searchTextField addTarget:self action:@selector(searchTextDidChange:) forControlEvents:UIControlEventEditingChanged];
+    [self.containerView addSubview:self.searchTextField];
+
+    self.centerPlaceholderView = [[UIView alloc] initWithFrame:CGRectZero];
+    self.centerPlaceholderView.userInteractionEnabled = NO;
+    [self.containerView addSubview:self.centerPlaceholderView];
+
+    self.centerIconView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"magnifyingglass"]];
+    self.centerIconView.tintColor = [UIColor colorWithWhite:0 alpha:0.38];
+    self.centerIconView.contentMode = UIViewContentModeScaleAspectFit;
+    [self.centerPlaceholderView addSubview:self.centerIconView];
+
+    self.centerPlaceholderLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.centerPlaceholderLabel.text = @"搜索设置项";
+    self.centerPlaceholderLabel.textColor = [UIColor colorWithWhite:0 alpha:0.38];
+    self.centerPlaceholderLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
+    [self.centerPlaceholderView addSubview:self.centerPlaceholderLabel];
+
+    [self updateSearchPlaceholderVisibility];
+    [self updateLayout];
+    tableView.tableHeaderView = self.headerView;
+    [self installNavigationInterceptors];
+    [self updateNavigationGestureState];
+}
+
+- (void)updateLayout {
+    UITableView *tableView = self.settingsVC.tableView;
+    if (!tableView || !self.headerView || !self.containerView || !self.centerPlaceholderView || !self.centerIconView || !self.centerPlaceholderLabel) {
+        return;
+    }
+
+    CGFloat width = tableView.bounds.size.width;
+    if (width <= 0) {
+        return;
+    }
+
+    BOOL needsHeaderUpdate = fabs(self.headerView.frame.size.width - width) > 0.5;
+    self.headerView.frame = CGRectMake(0, 0, width, 64);
+    self.containerView.frame = CGRectMake(16, 8, width - 32, 44);
+    self.searchTextField.frame = self.containerView.bounds;
+
+    CGFloat iconSize = 18.0;
+    CGFloat spacing = 8.0;
+    CGSize labelSize = [self.centerPlaceholderLabel.text sizeWithAttributes:@{NSFontAttributeName : self.centerPlaceholderLabel.font}];
+    CGFloat placeholderWidth = iconSize + spacing + ceil(labelSize.width);
+    CGFloat placeholderHeight = MAX(iconSize, ceil(labelSize.height));
+    self.centerPlaceholderView.frame = CGRectMake((CGRectGetWidth(self.containerView.bounds) - placeholderWidth) / 2.0,
+                                                  (CGRectGetHeight(self.containerView.bounds) - placeholderHeight) / 2.0,
+                                                  placeholderWidth,
+                                                  placeholderHeight);
+    self.centerIconView.frame = CGRectMake(0, (placeholderHeight - iconSize) / 2.0, iconSize, iconSize);
+    self.centerPlaceholderLabel.frame = CGRectMake(iconSize + spacing, 0, ceil(labelSize.width), placeholderHeight);
+
+    if (needsHeaderUpdate) {
+        tableView.tableHeaderView = self.headerView;
+    }
+
+    [self installNavigationInterceptors];
+    [self updateNavigationGestureState];
+}
+
+- (NSString *)trimmedSearchText {
+    return [self.searchTextField.text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+- (void)updateSearchPlaceholderVisibility {
+    BOOL showCenteredPlaceholder = !self.searchTextField.isEditing && [self trimmedSearchText].length == 0;
+    self.centerPlaceholderView.hidden = !showCenteredPlaceholder;
+    self.searchTextField.placeholder = showCenteredPlaceholder ? nil : @"搜索设置项";
+    self.searchTextField.leftViewMode = showCenteredPlaceholder ? UITextFieldViewModeNever : UITextFieldViewModeAlways;
+}
+
+- (NSArray *)sectionsForSearchText:(NSString *)searchText {
+    NSString *query = [searchText lowercaseString];
+    if (query.length == 0) {
+        return self.originalSections;
+    }
+
+    NSMutableDictionary<NSString *, NSMutableArray *> *groupedItems = [NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> *orderedPaths = [NSMutableArray array];
+    for (NSDictionary *entry in self.searchEntries) {
+        NSString *searchableText = [entry[@"searchableText"] lowercaseString];
+        if (![searchableText containsString:query]) {
+            continue;
+        }
+
+        AWESettingItemModel *item = entry[@"item"];
+        DYYYRefreshSearchItemValue(item);
+        NSString *path = entry[@"path"] ?: @"DYYY";
+        NSMutableArray *items = groupedItems[path];
+        if (!items) {
+            items = [NSMutableArray array];
+            groupedItems[path] = items;
+            [orderedPaths addObject:path];
+        }
+        [items addObject:item];
+    }
+
+    NSMutableArray *sections = [NSMutableArray array];
+    for (NSString *path in orderedPaths) {
+        NSArray *items = groupedItems[path];
+        if (items.count == 0) {
+            continue;
+        }
+
+        AWESettingSectionModel *section = [[NSClassFromString(@"AWESettingSectionModel") alloc] init];
+        section.sectionHeaderTitle = path;
+        section.sectionHeaderHeight = 40;
+        section.type = 0;
+        section.itemArray = items;
+        [sections addObject:section];
+    }
+
+    if (sections.count == 0) {
+        AWESettingSectionModel *emptySection = [[NSClassFromString(@"AWESettingSectionModel") alloc] init];
+        emptySection.sectionHeaderTitle = @"未找到相关设置";
+        emptySection.sectionHeaderHeight = 40;
+        emptySection.type = 0;
+        emptySection.itemArray = @[];
+        [sections addObject:emptySection];
+    }
+
+    return sections;
+}
+
+- (void)searchTextDidChange:(UITextField *)textField {
+    [self updateSearchPlaceholderVisibility];
+    self.viewModel.sectionDataArray = [self sectionsForSearchText:[self trimmedSearchText]];
+    [self.settingsVC.tableView reloadData];
+    [self updateNavigationGestureState];
+}
+
+- (BOOL)isSearchInteractionActive {
+    return self.searchTextField.isFirstResponder || [self trimmedSearchText].length > 0;
+}
+
+- (BOOL)handleBackNavigationRequest {
+    if (![self isSearchInteractionActive]) {
+        return NO;
+    }
+
+    self.searchTextField.text = @"";
+    [self.searchTextField resignFirstResponder];
+    [self updateSearchPlaceholderVisibility];
+    self.viewModel.sectionDataArray = self.originalSections;
+    [self.settingsVC.tableView reloadData];
+    [self updateNavigationGestureState];
+    return YES;
+}
+
+- (void)installNavigationInterceptors {
+    UINavigationController *navigationController = self.settingsVC.navigationController;
+    UIGestureRecognizer *popGesture = navigationController.interactivePopGestureRecognizer;
+    if (!navigationController || !popGesture) {
+        return;
+    }
+
+    self.navigationController = navigationController;
+    if (!self.hasStoredInteractivePopGestureEnabled) {
+        self.previousInteractivePopGestureEnabled = popGesture.enabled;
+        self.hasStoredInteractivePopGestureEnabled = YES;
+    }
+    if (popGesture.delegate != (id<UIGestureRecognizerDelegate>)self) {
+        self.previousInteractivePopGestureDelegate = popGesture.delegate;
+        popGesture.delegate = (id<UIGestureRecognizerDelegate>)self;
+    }
+
+    if (!self.searchBackGestureRecognizer) {
+        self.searchBackGestureRecognizer = [[UIScreenEdgePanGestureRecognizer alloc] initWithTarget:self action:@selector(handleSearchBackGesture:)];
+        self.searchBackGestureRecognizer.edges = UIRectEdgeLeft;
+        self.searchBackGestureRecognizer.delegate = (id<UIGestureRecognizerDelegate>)self;
+        self.searchBackGestureRecognizer.enabled = NO;
+        [self.settingsVC.view addGestureRecognizer:self.searchBackGestureRecognizer];
+    }
+}
+
+- (void)updateNavigationGestureState {
+    UINavigationController *navigationController = self.settingsVC.navigationController ?: self.navigationController;
+    UIGestureRecognizer *popGesture = navigationController.interactivePopGestureRecognizer;
+    BOOL searchActive = [self isSearchInteractionActive];
+
+    if (popGesture) {
+        if (!self.hasStoredInteractivePopGestureEnabled) {
+            self.previousInteractivePopGestureEnabled = popGesture.enabled;
+            self.hasStoredInteractivePopGestureEnabled = YES;
+        }
+        if (searchActive) {
+            popGesture.enabled = NO;
+        } else {
+            popGesture.enabled = self.previousInteractivePopGestureEnabled;
+        }
+    }
+
+    self.searchBackGestureRecognizer.enabled = searchActive;
+}
+
+- (void)restoreNavigationGestureState {
+    UINavigationController *navigationController = self.settingsVC.navigationController ?: self.navigationController;
+    UIGestureRecognizer *popGesture = navigationController.interactivePopGestureRecognizer;
+    if (popGesture.delegate == (id<UIGestureRecognizerDelegate>)self) {
+        popGesture.delegate = self.previousInteractivePopGestureDelegate;
+    }
+    if (self.hasStoredInteractivePopGestureEnabled) {
+        popGesture.enabled = self.previousInteractivePopGestureEnabled;
+    }
+    self.searchBackGestureRecognizer.enabled = NO;
+}
+
+- (void)handleSearchBackGesture:(UIScreenEdgePanGestureRecognizer *)gestureRecognizer {
+    if (gestureRecognizer.state == UIGestureRecognizerStateBegan) {
+        [self handleBackNavigationRequest];
+    }
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (gestureRecognizer == self.searchBackGestureRecognizer) {
+        return [self isSearchInteractionActive];
+    }
+
+    if (gestureRecognizer == self.navigationController.interactivePopGestureRecognizer && [self handleBackNavigationRequest]) {
+        return NO;
+    }
+
+    id<UIGestureRecognizerDelegate> delegate = self.previousInteractivePopGestureDelegate;
+    if (delegate && delegate != (id<UIGestureRecognizerDelegate>)self && [delegate respondsToSelector:@selector(gestureRecognizerShouldBegin:)]) {
+        return [delegate gestureRecognizerShouldBegin:gestureRecognizer];
+    }
+
+    return YES;
+}
+
+- (void)textFieldDidBeginEditing:(UITextField *)textField {
+    [self updateSearchPlaceholderVisibility];
+    [self updateNavigationGestureState];
+}
+
+- (void)textFieldDidEndEditing:(UITextField *)textField {
+    [self updateSearchPlaceholderVisibility];
+    [self updateNavigationGestureState];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    return NO;
+}
+
+- (void)dealloc {
+    [self restoreNavigationGestureState];
+}
+
+@end
+
+static void DYYYAttachSettingsSearchHeader(AWESettingBaseViewController *settingsVC, AWESettingsViewModel *viewModel, NSArray *sections) {
+    if (!settingsVC || !viewModel || sections.count == 0) {
+        return;
+    }
+
+    DYYYSettingsSearchCoordinator *coordinator = [[DYYYSettingsSearchCoordinator alloc] initWithSettingsVC:settingsVC viewModel:viewModel originalSections:sections searchEntries:DYYYSettingsSearchEntries()];
+    objc_setAssociatedObject(settingsVC, &kDYYYSettingsSearchCoordinatorKey, coordinator, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [coordinator installSearchHeader];
+    });
+}
+
+static void DYYYBuildSettingsSearchIndexIfNeeded(NSArray<AWESettingItemModel *> *categoryItems) {
+    if (DYYYSettingsSearchIndexBuilt) {
+        return;
+    }
+
+    DYYYSettingsSearchIndexBuilt = YES;
+    DYYYBuildingSettingsSearchIndex = YES;
+    for (AWESettingItemModel *item in categoryItems) {
+        if (item.cellTappedBlock) {
+            item.cellTappedBlock();
+        }
+    }
+    DYYYBuildingSettingsSearchIndex = NO;
+}
+
 %hook AWESettingBaseViewController
 - (BOOL)useCardUIStyle {
     return YES;
@@ -53,10 +617,66 @@ static void DYYYRemoveRemoteConfigObserver(void) {
     return original;
 }
 
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DYYYSettingsSearchCoordinator *coordinator = objc_getAssociatedObject(self, &kDYYYSettingsSearchCoordinatorKey);
+    [coordinator installNavigationInterceptors];
+    [coordinator updateNavigationGestureState];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    DYYYSettingsSearchCoordinator *coordinator = objc_getAssociatedObject(self, &kDYYYSettingsSearchCoordinatorKey);
+    [coordinator restoreNavigationGestureState];
+    %orig;
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    DYYYSettingsSearchCoordinator *coordinator = objc_getAssociatedObject(self, &kDYYYSettingsSearchCoordinatorKey);
+    [coordinator updateLayout];
+    for (AWESettingsTableViewCell *cell in self.tableView.visibleCells) {
+        if ([cell isKindOfClass:%c(AWESettingsTableViewCell)]) {
+            DYYYApplyFeedNowPlayingIconToCell(cell);
+        }
+    }
+}
+
 - (void)dealloc {
     DYYYRemoveRemoteConfigObserver();
     %orig;
 }
+%end
+
+%hook UINavigationController
+
+- (UIViewController *)popViewControllerAnimated:(BOOL)animated {
+    DYYYSettingsSearchCoordinator *coordinator = objc_getAssociatedObject(self.topViewController, &kDYYYSettingsSearchCoordinatorKey);
+    if ([coordinator handleBackNavigationRequest]) {
+        return nil;
+    }
+
+    return %orig;
+}
+
+%end
+
+%hook AWESettingsTableViewCell
+
+- (void)setItemModel:(AWESettingItemModel *)itemModel {
+    %orig;
+    DYYYApplyFeedNowPlayingIconToCell(self);
+}
+
+- (void)updateSubviews {
+    %orig;
+    DYYYApplyFeedNowPlayingIconToCell(self);
+}
+
+- (void)updateSubviewsAfterLayout {
+    %orig;
+    DYYYApplyFeedNowPlayingIconToCell(self);
+}
+
 %end
 
 // 隐藏掉天气Label
@@ -509,6 +1129,18 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
             @"detail" : @"",
             @"cellType" : @37,
             @"imageName" : @"ic_clock_outlined_20"},
+          @{@"identifier" : @"DYYYDisableProfileVisitRecordUpload",
+            @"title" : @"禁用访客记录上传",
+            @"subTitle" : @"访问用户主页时不上传该访问记录",
+            @"detail" : @"",
+            @"cellType" : @37,
+            @"imageName" : @"ic_eyeslash_outlined_16"},
+          @{@"identifier" : @"DYYYDisableFeedNowPlayingInfo",
+            @"title" : kDYYYFeedNowPlayingSettingTitle,
+            @"subTitle" : @"开启后禁止信息流视频播放信息显示在灵动岛",
+            @"detail" : @"",
+            @"cellType" : @37,
+            @"imageName" : kDYYYFeedNowPlayingSVGIconName},
           @{@"identifier" : @"DYYYEnableVideoHighestQuality",
             @"title" : @"提高视频画质",
             @"detail" : @"",
@@ -628,11 +1260,11 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
               @"cellType" : @20,
               @"imageName" : @"ic_playertime_outlined_20"
           },
-          @{@"identifier" : @"DYYYFilterFeedHDR",
-            @"title" : @"推荐过滤HDR",
-            @"subTitle" : @"开启后推荐流会屏蔽 HDR 视频",
-            @"detail" : @"",
-            @"cellType" : @37,
+          @{@"identifier" : @"DYYYHDRMode",
+            @"title" : @"全局HDR设置",
+            @"subTitle" : @"开启并选择后全局屏蔽HDR效果/过滤HDR作品。",
+            @"detail" : @"关闭",
+            @"cellType" : @26,
             @"imageName" : @"ic_sun_outlined"},
           @{@"identifier" : @"DYYYNoAds",
             @"title" : @"启用屏蔽广告",
@@ -751,6 +1383,20 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
                 };
                 [keywordListView show];
               };
+          } else if ([item.identifier isEqualToString:@"DYYYHDRMode"]) {
+              NSString *savedMode = [[NSUserDefaults standardUserDefaults] stringForKey:@"DYYYHDRMode"] ?: @"关闭";
+              item.detail = savedMode;
+              item.cellTappedBlock = ^{
+                NSArray *options = @[ @"关闭", @"全局屏蔽HDR效果", @"全局过滤HDR作品" ];
+                [DYYYOptionsSelectionView showWithPreferenceKey:@"DYYYHDRMode"
+                                                   optionsArray:options
+                                                     headerText:@"选择 HDR 处理模式"
+                                                 onPresentingVC:topView()
+                                               selectionChanged:^(NSString *selectedValue) {
+                                                 item.detail = selectedValue;
+                                                 [item refreshCell];
+                                               }];
+              };
           }
           [filterItems addObject:item];
       }
@@ -782,6 +1428,11 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"杂项设置" items:miscellaneousItems]];
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"过滤与屏蔽" footerTitle:@"请不要同时开启过多过滤推荐项目，这会增大视频流加载延迟。" items:filterItems]];
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"二次确认" items:securityItems]];
+
+      DYYYRegisterSearchSections(@"基本设置", sections);
+      if (DYYYBuildingSettingsSearchIndex) {
+          return;
+      }
 
       // 创建并推入二级设置页面
       AWESettingBaseViewController *subVC = [DYYYSettingsHelper createSubSettingsViewController:@"基本设置" sections:sections];
@@ -963,6 +1614,11 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"标题自定义" items:titleItems]];
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"图标自定义" items:iconItems]];
       // 创建并组织所有section
+      DYYYRegisterSearchSections(@"界面设置", sections);
+      if (DYYYBuildingSettingsSearchIndex) {
+          return;
+      }
+
       // 创建并推入二级设置页面
       AWESettingBaseViewController *subVC = [DYYYSettingsHelper createSubSettingsViewController:@"界面设置" sections:sections];
       [rootVC.navigationController pushViewController:(UIViewController *)subVC animated:YES];
@@ -1779,6 +2435,11 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"直播间界面" items:livestreamItems]];
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"隐藏面板功能" footerTitle:@"隐藏视频长按面板中的功能" items:modernpanels]];
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"隐藏长按评论功能" footerTitle:@"隐藏评论长按面板中的功能" items:commentpanel]];
+      DYYYRegisterSearchSections(@"隐藏设置", sections);
+      if (DYYYBuildingSettingsSearchIndex) {
+          return;
+      }
+
       // 创建并推入二级设置页面
       AWESettingBaseViewController *subVC = [DYYYSettingsHelper createSubSettingsViewController:@"隐藏设置" sections:sections];
       [rootVC.navigationController pushViewController:(UIViewController *)subVC animated:YES];
@@ -1901,6 +2562,11 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
 
       NSMutableArray *sections = [NSMutableArray array];
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"顶栏选项" items:removeSettingsItems]];
+
+      DYYYRegisterSearchSections(@"顶栏移除", sections);
+      if (DYYYBuildingSettingsSearchIndex) {
+          return;
+      }
 
       AWESettingBaseViewController *subVC = [DYYYSettingsHelper createSubSettingsViewController:@"顶栏移除" sections:sections];
       [rootVC.navigationController pushViewController:(UIViewController *)subVC animated:YES];
@@ -2914,6 +3580,11 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"ABTest"
                                                          footerTitle:@"允许用户导出或导入抖音的 ABTest 配置。远程配置由 Nathalie 维护，在应用启动时自动更新远程配置。"
                                                                items:hotUpdateItems]];
+      DYYYRegisterSearchSections(@"增强设置", sections);
+      if (DYYYBuildingSettingsSearchIndex) {
+          return;
+      }
+
       // 创建并推入二级设置页面
       AWESettingBaseViewController *subVC = [DYYYSettingsHelper createSubSettingsViewController:@"增强设置" sections:sections];
       [rootVC.navigationController pushViewController:(UIViewController *)subVC animated:YES];
@@ -2971,8 +3642,9 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
                                        // 保存用户输入的倍速值
                                        NSString *trimmedText = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
                                        [[NSUserDefaults standardUserDefaults] setObject:trimmedText forKey:@"DYYYSpeedSettings"];
-speedSettingsItem.detail = trimmedText;
+                                       speedSettingsItem.detail = trimmedText;
                                        [speedSettingsItem refreshCell];
+                                       [FloatingSpeedButton reloadConfiguration];
                                      }
                                       onCancel:nil];
       };
@@ -3009,7 +3681,8 @@ speedSettingsItem.detail = trimmedText;
         BOOL newValue = !showXItem.isSwitchOn;
         showXItem.isSwitchOn = newValue;
         [[NSUserDefaults standardUserDefaults] setBool:newValue forKey:@"DYYYSpeedButtonShowX"];
-};
+        [FloatingSpeedButton reloadConfiguration];
+      };
       [speedButtonItems addObject:showXItem];
       // 添加按钮大小配置项
       AWESettingItemModel *buttonSizeItem = [[%c(AWESettingItemModel) alloc] init];
@@ -3024,7 +3697,7 @@ speedSettingsItem.detail = trimmedText;
       buttonSizeItem.colorStyle = 0;
       buttonSizeItem.isEnable = YES;
       buttonSizeItem.cellTappedBlock = ^{
-        NSString *currentValue = [NSString stringWithFormat:@"%.0f", currentButtonSize];
+        NSString *currentValue = buttonSizeItem.detail ?: @"32";
         [DYYYSettingsHelper showTextInputAlert:@"设置按钮大小"
                                    defaultText:currentValue
                                    placeholder:@"请输入20-60之间的数值"
@@ -3034,6 +3707,7 @@ speedSettingsItem.detail = trimmedText;
                                            [[NSUserDefaults standardUserDefaults] setFloat:size forKey:@"DYYYSpeedButtonSize"];
                                            buttonSizeItem.detail = [NSString stringWithFormat:@"%.0f", (CGFloat)size];
                                            [buttonSizeItem refreshCell];
+                                           [FloatingSpeedButton reloadConfiguration];
                                        } else {
                                            [DYYYUtils showToast:@"请输入20-60之间的有效数值"];
                                        }
@@ -3065,6 +3739,7 @@ speedSettingsItem.detail = trimmedText;
         if (originalSpeedSwitchChangedBlock) {
             originalSpeedSwitchChangedBlock();
         }
+        [FloatingSpeedButton reloadConfiguration];
         refreshSpeedDependentItems();
       };
 
@@ -3094,7 +3769,7 @@ speedSettingsItem.detail = trimmedText;
       clearButtonSizeItem.colorStyle = 0;
       clearButtonSizeItem.isEnable = YES;
       clearButtonSizeItem.cellTappedBlock = ^{
-        NSString *currentValue = [NSString stringWithFormat:@"%.0f", currentClearButtonSize];
+        NSString *currentValue = clearButtonSizeItem.detail ?: @"40";
         [DYYYSettingsHelper showTextInputAlert:@"设置清屏按钮大小"
                                    defaultText:currentValue
                                    placeholder:@"请输入20-60之间的数值"
@@ -3105,6 +3780,7 @@ speedSettingsItem.detail = trimmedText;
                                            [[NSUserDefaults standardUserDefaults] setFloat:size forKey:@"DYYYEnableFloatClearButtonSize"];
                                            clearButtonSizeItem.detail = [NSString stringWithFormat:@"%.0f", (CGFloat)size];
                                            [clearButtonSizeItem refreshCell];
+                                           reloadClearButtonConfiguration();
                                        } else {
                                            [DYYYUtils showToast:@"请输入20-60之间的有效数值"];
                                        }
@@ -3177,26 +3853,79 @@ speedSettingsItem.detail = trimmedText;
       [clearButtonItems addObject:hideTabButton];
       AWESettingItemModel *hideSpeedButton = [DYYYSettingsHelper createSettingItem:@{
           @"identifier" : @"DYYYHideSpeed",
-          @"title" : @"清屏隐藏倍速",
+          @"title" : @"清屏隐藏倍速按钮",
           @"subTitle" : @"清屏状态下隐藏DYYY的倍速按钮",
           @"detail" : @"",
           @"cellType" : @37,
           @"imageName" : @"ic_eyeslash_outlined_16"
       }];
       [clearButtonItems addObject:hideSpeedButton];
-      // 获取清屏按钮的当前开关状态
-      BOOL isEnabled = [DYYYSettingsHelper getUserDefaults:@"DYYYEnableFloatClearButton"];
+      // 清屏后隐藏清屏按钮自身（仍可点击恢复）
+      AWESettingItemModel *hideClearButtonOnTap = [DYYYSettingsHelper createSettingItem:@{
+          @"identifier" : @"DYYYHideClearButtonOnTap",
+          @"title" : @"清屏隐藏清屏按钮",
+          @"subTitle" : @"清屏后隐藏清屏按钮自身，原位置仍可点击恢复",
+          @"detail" : @"",
+          @"cellType" : @37,
+          @"imageName" : @"ic_eyeslash_outlined_16"
+      }];
+      [clearButtonItems addObject:hideClearButtonOnTap];
+      AWESettingItemModel *hidePauseVideoIcon = [DYYYSettingsHelper createSettingItem:@{
+          @"identifier" : @"DYYYHidePauseVideoIcon",
+          @"title" : @"清屏隐藏暂停图标",
+          @"subTitle" : @"清屏状态下隐藏视频中央的播放/暂停图标",
+          @"detail" : @"",
+          @"cellType" : @37,
+          @"imageName" : @"ic_eyeslash_outlined_16"
+      }];
+      [clearButtonItems addObject:hidePauseVideoIcon];
+      AWESettingItemModel *hideStatusBarOnClear = [DYYYSettingsHelper createSettingItem:@{
+          @"identifier" : @"DYYYHideStatusBarOnClear",
+          @"title" : @"清屏隐藏状态栏",
+          @"subTitle" : @"清屏状态下隐藏系统顶部状态栏",
+          @"detail" : @"",
+          @"cellType" : @37,
+          @"imageName" : @"ic_eyeslash_outlined_16"
+      }];
+      [clearButtonItems addObject:hideStatusBarOnClear];
+      NSMutableArray<AWESettingItemModel *> *clearDependentItems = [NSMutableArray array];
       for (AWESettingItemModel *item in clearButtonItems) {
-          if (item == enableClearButton) {
+          if (item != enableClearButton) {
+              [clearDependentItems addObject:item];
+          }
+      }
+      void (^refreshClearDependentItems)(void) = ^{
+        for (AWESettingItemModel *item in clearDependentItems) {
+            [DYYYSettingsHelper applyDependencyRulesForItem:item];
+            [item refreshCell];
+        }
+      };
+
+      refreshClearDependentItems();
+
+      for (AWESettingItemModel *item in clearButtonItems) {
+          void (^originalClearSwitchChangedBlock)(void) = item.switchChangedBlock;
+          if (!originalClearSwitchChangedBlock) {
               continue;
           }
-          item.isEnable = isEnabled;
+          item.switchChangedBlock = ^{
+            originalClearSwitchChangedBlock();
+            reloadClearButtonConfiguration();
+            if (item == enableClearButton) {
+                refreshClearDependentItems();
+            }
+          };
       }
 
       // 创建并组织所有section
       NSMutableArray *sections = [NSMutableArray array];
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"快捷倍速" items:speedButtonItems]];
       [sections addObject:[DYYYSettingsHelper createSectionWithTitle:@"一键清屏" items:clearButtonItems]];
+
+      DYYYRegisterSearchSections(@"悬浮按钮", sections);
+      if (DYYYBuildingSettingsSearchIndex) {
+          return;
+      }
 
       // 创建并推入二级设置页面
       AWESettingBaseViewController *subVC = [DYYYSettingsHelper createSubSettingsViewController:@"悬浮按钮" sections:sections];
@@ -3617,8 +4346,14 @@ speedSettingsItem.detail = trimmedText;
     mainSection.itemArray = mainItems;
     aboutSection.itemArray = aboutItems;
 
-    viewModel.sectionDataArray = @[ mainSection, cleanupSection, backupSection, aboutSection ];
+    DYYYResetSettingsSearchIndex();
+    DYYYBuildSettingsSearchIndexIfNeeded(mainItems);
+    DYYYRegisterSearchSections(@"DYYY", @[ cleanupSection, backupSection, aboutSection ]);
+
+    NSArray *rootSections = @[ mainSection, cleanupSection, backupSection, aboutSection ];
+    viewModel.sectionDataArray = rootSections;
     objc_setAssociatedObject(settingsVC, &kViewModelKey, viewModel, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    DYYYAttachSettingsSearchHeader(settingsVC, viewModel, rootSections);
     [rootVC.navigationController pushViewController:(UIViewController *)settingsVC animated:YES];
 }
 

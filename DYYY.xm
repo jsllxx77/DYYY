@@ -6,9 +6,12 @@
 //  Created on: 2024/10/04
 //
 #import <QuartzCore/QuartzCore.h>
+#import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
+#import <dlfcn.h>
 #import <float.h>
 #import <math.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <syslog.h>
@@ -206,7 +209,7 @@ static UIImage *DYYYLoadCustomImage(NSString *fileName, CGSize targetSize) {
 }
 
 static BOOL DYYYShouldHandleSpeedFeatures(void) {
-    if (isFloatSpeedButtonEnabled) {
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYEnableFloatSpeedButton"]) {
         return YES;
     }
 
@@ -216,6 +219,404 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
     }
 
     return fabsf(defaultSpeed - 1.0f) > FLT_EPSILON;
+}
+
+static __weak AWEPlayInteractionViewController *dyyyActiveSpeedInteractionController = nil;
+static __weak AWEAwemeModel *dyyyCurrentSpeedAweme = nil;
+static NSString *dyyyLastAutoRestoredSpeedAwemeIdentifier = nil;
+static BOOL dyyyLongPressFastSpeedActive = NO;
+static BOOL dyyyLongPressLockedSpeedActive = NO;
+
+static void DYYYClearLongPressSpeedState(void) {
+    dyyyLongPressFastSpeedActive = NO;
+    dyyyLongPressLockedSpeedActive = NO;
+}
+
+static CGFloat DYYYViewControllerVisibilityScore(UIViewController *viewController) {
+    if (!viewController || !viewController.isViewLoaded) {
+        return -1.0;
+    }
+
+    UIView *view = viewController.view;
+    UIWindow *window = view.window;
+    if (!window || view.hidden || view.alpha <= 0.01 || CGRectIsEmpty(view.bounds)) {
+        return -1.0;
+    }
+
+    CGRect frameInWindow = [view convertRect:view.bounds toView:window];
+    CGRect visibleFrame = CGRectIntersection(frameInWindow, window.bounds);
+    if (CGRectIsNull(visibleFrame) || CGRectIsEmpty(visibleFrame)) {
+        return -1.0;
+    }
+
+    CGFloat visibleArea = CGRectGetWidth(visibleFrame) * CGRectGetHeight(visibleFrame);
+    CGFloat totalArea = CGRectGetWidth(frameInWindow) * CGRectGetHeight(frameInWindow);
+    CGFloat visibleRatio = totalArea > 0.0 ? visibleArea / totalArea : 0.0;
+    CGPoint windowCenter = CGPointMake(CGRectGetMidX(window.bounds), CGRectGetMidY(window.bounds));
+    CGFloat centerBonus = CGRectContainsPoint(visibleFrame, windowCenter) ? 1000000000.0 : 0.0;
+    return centerBonus + visibleRatio * 1000000.0 + visibleArea;
+}
+
+static BOOL DYYYAwemeModelsMatch(AWEAwemeModel *lhs, AWEAwemeModel *rhs) {
+    if (!lhs || !rhs) {
+        return NO;
+    }
+    if (lhs == rhs) {
+        return YES;
+    }
+
+    NSString *lhsItemID = lhs.itemID;
+    NSString *rhsItemID = rhs.itemID;
+    return lhsItemID.length > 0 && rhsItemID.length > 0 && [lhsItemID isEqualToString:rhsItemID];
+}
+
+static NSString *DYYYSpeedAwemeIdentifier(AWEAwemeModel *aweme) {
+    if (!aweme) {
+        return nil;
+    }
+    if (aweme.itemID.length > 0) {
+        return aweme.itemID;
+    }
+    return [NSString stringWithFormat:@"%p", aweme];
+}
+
+static AWEAwemeModel *DYYYSpeedAwemeFromObject(id object) {
+    Class awemeClass = NSClassFromString(@"AWEAwemeModel");
+    if (!object || !awemeClass) {
+        return nil;
+    }
+    if ([object isKindOfClass:awemeClass]) {
+        return (AWEAwemeModel *)object;
+    }
+
+    for (NSString *key in @[ @"model", @"awemeModel", @"currentAweme" ]) {
+        @try {
+            id value = [object valueForKey:key];
+            if ([value isKindOfClass:awemeClass]) {
+                return (AWEAwemeModel *)value;
+            }
+        } @catch (NSException *exception) {
+        }
+    }
+    return nil;
+}
+
+static double DYYYDefaultPlaybackSpeed(void) {
+    double defaultSpeed = [[NSUserDefaults standardUserDefaults] doubleForKey:@"DYYYDefaultSpeed"];
+    if (isfinite(defaultSpeed) && defaultSpeed > 0.0) {
+        return defaultSpeed;
+    }
+    return 1.0;
+}
+
+static void DYYYRestoreFloatSpeedButtonForAwemeIfNeeded(AWEAwemeModel *aweme) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL shouldAutoRestore = [defaults boolForKey:@"DYYYEnableFloatSpeedButton"] && [defaults boolForKey:@"DYYYAutoRestoreSpeed"];
+    if (!shouldAutoRestore) {
+        dyyyLastAutoRestoredSpeedAwemeIdentifier = nil;
+        return;
+    }
+
+    NSString *awemeIdentifier = DYYYSpeedAwemeIdentifier(aweme);
+    if (awemeIdentifier.length == 0 || [awemeIdentifier isEqualToString:dyyyLastAutoRestoredSpeedAwemeIdentifier]) {
+        return;
+    }
+
+    dyyyLastAutoRestoredSpeedAwemeIdentifier = [awemeIdentifier copy];
+    if (!setCurrentSpeedValue((float)DYYYDefaultPlaybackSpeed())) {
+        setCurrentSpeedIndex(0);
+    }
+    updateSpeedButtonUI();
+}
+
+static NSArray<AWEPlayInteractionViewController *> *DYYYSpeedInteractionControllers(AWEPlayInteractionViewController *preferredController) {
+    NSMutableArray<AWEPlayInteractionViewController *> *controllers = [NSMutableArray array];
+    Class interactionControllerClass = NSClassFromString(@"AWEPlayInteractionViewController");
+    UIWindow *window = [DYYYUtils getActiveWindow];
+    UIViewController *rootViewController = window.rootViewController;
+    while (rootViewController.presentedViewController) {
+        rootViewController = rootViewController.presentedViewController;
+    }
+
+    for (UIViewController *viewController in rootViewController ? findViewControllersInHierarchy(rootViewController) : @[]) {
+        if (interactionControllerClass && [viewController isKindOfClass:interactionControllerClass]) {
+            [controllers addObject:(AWEPlayInteractionViewController *)viewController];
+        }
+    }
+
+    if (preferredController && ![controllers containsObject:preferredController]) {
+        [controllers addObject:preferredController];
+    }
+    return controllers;
+}
+
+static AWEPlayInteractionViewController *DYYYResolveSpeedInteractionController(AWEPlayInteractionViewController *preferredController, AWEAwemeModel *targetAweme, BOOL allowVisibleFallback) {
+    AWEPlayInteractionViewController *bestModelMatch = nil;
+    AWEPlayInteractionViewController *bestVisibleController = nil;
+    CGFloat bestModelMatchScore = -1.0;
+    CGFloat bestVisibleScore = -1.0;
+
+    for (AWEPlayInteractionViewController *controller in DYYYSpeedInteractionControllers(preferredController)) {
+        CGFloat visibilityScore = DYYYViewControllerVisibilityScore(controller);
+        if (visibilityScore < 0.0) {
+            continue;
+        }
+
+        if (visibilityScore > bestVisibleScore) {
+            bestVisibleScore = visibilityScore;
+            bestVisibleController = controller;
+        }
+        if (targetAweme && DYYYAwemeModelsMatch(controller.model, targetAweme) && visibilityScore > bestModelMatchScore) {
+            bestModelMatchScore = visibilityScore;
+            bestModelMatch = controller;
+        }
+    }
+
+    return bestModelMatch ?: (allowVisibleFallback ? bestVisibleController : nil);
+}
+
+static AWEPlayInteractionViewController *DYYYResolveCurrentSpeedInteractionController(AWEPlayInteractionViewController *preferredController) {
+    return DYYYResolveSpeedInteractionController(preferredController, dyyyCurrentSpeedAweme, YES);
+}
+
+id DYYYCurrentSpeedInteractionController(void) {
+    return DYYYResolveCurrentSpeedInteractionController(dyyyActiveSpeedInteractionController);
+}
+
+static void DYYYEnsureFloatSpeedButton(AWEPlayInteractionViewController *interactionController) {
+    [FloatingSpeedButton reloadConfiguration];
+    AWEAwemeModel *targetAweme = dyyyCurrentSpeedAweme;
+    BOOL allowVisibleFallback = !targetAweme || (interactionController && DYYYAwemeModelsMatch(interactionController.model, targetAweme));
+    AWEPlayInteractionViewController *currentController = DYYYResolveSpeedInteractionController(interactionController, targetAweme, allowVisibleFallback);
+    if (!currentController) {
+        updateSpeedButtonVisibility();
+        return;
+    }
+
+    if ((dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) &&
+        currentController.model &&
+        !DYYYAwemeModelsMatch(dyyyCurrentSpeedAweme, currentController.model)) {
+        DYYYClearLongPressSpeedState();
+    }
+
+    dyyyActiveSpeedInteractionController = currentController;
+    dyyyCurrentSpeedAweme = currentController.model;
+    dyyyInteractionViewVisible = YES;
+
+    if (!isFloatSpeedButtonEnabled) {
+        updateSpeedButtonVisibility();
+        return;
+    }
+
+    UIWindow *keyWindow = [DYYYUtils getActiveWindow];
+    if (!keyWindow) {
+        return;
+    }
+
+    DYYYRestoreFloatSpeedButtonForAwemeIfNeeded(currentController.model);
+
+    if (!speedButton) {
+        CGRect windowBounds = keyWindow.bounds;
+        CGRect initialFrame = CGRectMake((windowBounds.size.width - speedButtonSize) / 2.0, (windowBounds.size.height - speedButtonSize) / 2.0, speedButtonSize, speedButtonSize);
+        speedButton = [[FloatingSpeedButton alloc] initWithFrame:initialFrame];
+        speedButton.interactionController = currentController;
+        updateSpeedButtonUI();
+    } else if (speedButton.interactionController != currentController) {
+        speedButton.interactionController = currentController;
+        [speedButton resetButtonState];
+    }
+
+    if (![speedButton isDescendantOfView:keyWindow]) {
+        [keyWindow addSubview:speedButton];
+        [speedButton loadSavedPosition];
+        [speedButton resetFadeTimer];
+    }
+
+    [keyWindow bringSubviewToFront:speedButton];
+    updateSpeedButtonVisibility();
+}
+
+// 提供给跨文件调用的刷新入口：根据当前可见 PlayInteractionVC 重新评估并恢复倍速按钮，
+// 用于清屏退出等场景，避免清屏期间 viewDidDisappear 把 dyyyInteractionViewVisible 置 NO 后状态卡住。
+void DYYYRefreshFloatSpeedButton(void) {
+    void (^applyBlock)(void) = ^{
+        AWEPlayInteractionViewController *currentController = (AWEPlayInteractionViewController *)DYYYCurrentSpeedInteractionController();
+        DYYYEnsureFloatSpeedButton(currentController);
+    };
+    if ([NSThread isMainThread]) {
+        applyBlock();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), applyBlock);
+    }
+}
+
+static BOOL DYYYSetPlaybackRateOnTarget(id target, double speed) {
+    if (!target || ![target respondsToSelector:@selector(setVideoControllerPlaybackRate:)]) {
+        return NO;
+    }
+
+    @try {
+        [(AWEAwemePlayVideoViewController *)target setVideoControllerPlaybackRate:speed];
+        return YES;
+    } @catch (NSException *exception) {
+        return NO;
+    }
+}
+
+static BOOL DYYYApplyPlaybackSpeed(AWEPlayInteractionViewController *interactionController, double speed) {
+    interactionController = DYYYResolveCurrentSpeedInteractionController(interactionController);
+    if (!interactionController) {
+        return NO;
+    }
+
+    Protocol *speedControllerProtocol = NSProtocolFromString(@"AWEFastSpeedControllerProtocol");
+    if (speedControllerProtocol && [interactionController respondsToSelector:@selector(controllerByProtocol:)]) {
+        @try {
+            id speedController = [interactionController controllerByProtocol:speedControllerProtocol];
+            if ([speedController respondsToSelector:@selector(playVideoViewController)]) {
+                id playVideoViewController = [(AWEPlayInteractionSpeedController *)speedController playVideoViewController];
+                if (DYYYSetPlaybackRateOnTarget(playVideoViewController, speed)) {
+                    return YES;
+                }
+            }
+        } @catch (NSException *exception) {
+        }
+    }
+
+    if ([interactionController respondsToSelector:@selector(videoDelegate)] && DYYYSetPlaybackRateOnTarget([interactionController videoDelegate], speed)) {
+        return YES;
+    }
+
+    UIWindow *window = [DYYYUtils getActiveWindow];
+    UIViewController *rootViewController = window.rootViewController;
+    while (rootViewController.presentedViewController) {
+        rootViewController = rootViewController.presentedViewController;
+    }
+
+    UIViewController *bestPlayerViewController = nil;
+    CGFloat bestPlayerVisibilityScore = -1.0;
+    for (UIViewController *viewController in rootViewController ? findViewControllersInHierarchy(rootViewController) : @[]) {
+        if ([viewController isKindOfClass:NSClassFromString(@"AWEAwemePlayVideoViewController")] ||
+            [viewController isKindOfClass:NSClassFromString(@"AWEDPlayerFeedPlayerViewController")] ||
+            [viewController isKindOfClass:NSClassFromString(@"AWEDPlayerViewController_Merge")]) {
+            CGFloat visibilityScore = DYYYViewControllerVisibilityScore(viewController);
+            if (visibilityScore > bestPlayerVisibilityScore) {
+                bestPlayerVisibilityScore = visibilityScore;
+                bestPlayerViewController = viewController;
+            }
+        }
+    }
+
+    return DYYYSetPlaybackRateOnTarget(bestPlayerViewController, speed);
+}
+
+static double DYYYConfiguredPlaybackSpeed(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if ([defaults boolForKey:@"DYYYEnableFloatSpeedButton"]) {
+        return getCurrentSpeed();
+    }
+
+    if ([defaults boolForKey:@"DYYYUserAgreementAccepted"]) {
+        return DYYYDefaultPlaybackSpeed();
+    }
+    return 1.0;
+}
+
+static BOOL DYYYShouldPrepareDefaultPlaybackSpeedForPlayer(id playerViewController) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (![defaults boolForKey:@"DYYYEnableFloatSpeedButton"] || ![defaults boolForKey:@"DYYYAutoRestoreSpeed"]) {
+        return NO;
+    }
+
+    AWEAwemeModel *targetAweme = DYYYSpeedAwemeFromObject(playerViewController) ?: dyyyCurrentSpeedAweme;
+    NSString *awemeIdentifier = DYYYSpeedAwemeIdentifier(targetAweme);
+    return awemeIdentifier.length > 0 && ![awemeIdentifier isEqualToString:dyyyLastAutoRestoredSpeedAwemeIdentifier];
+}
+
+static double DYYYPreparedPlaybackSpeedForPlayer(id playerViewController) {
+    // Auto-restore belongs to aweme transitions; current-video refreshes should keep the selected quick speed.
+    if (DYYYShouldPrepareDefaultPlaybackSpeedForPlayer(playerViewController)) {
+        return DYYYDefaultPlaybackSpeed();
+    }
+    return DYYYConfiguredPlaybackSpeed();
+}
+
+static void DYYYApplyPreparedPlaybackSpeedToPlayer(id playerViewController) {
+    if (!DYYYShouldHandleSpeedFeatures() || !playerViewController || dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) {
+        return;
+    }
+
+    double speed = DYYYPreparedPlaybackSpeedForPlayer(playerViewController);
+    void (^applyBlock)(void) = ^{
+      DYYYSetPlaybackRateOnTarget(playerViewController, speed);
+    };
+    if ([NSThread isMainThread]) {
+        applyBlock();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), applyBlock);
+    }
+}
+
+static void DYYYBindAndApplyCurrentPlaybackSpeed(void) {
+    if (!DYYYShouldHandleSpeedFeatures() || dyyyLongPressFastSpeedActive || dyyyLongPressLockedSpeedActive) {
+        return;
+    }
+
+    AWEAwemeModel *targetAweme = dyyyCurrentSpeedAweme;
+    AWEPlayInteractionViewController *currentController = DYYYResolveSpeedInteractionController(nil, targetAweme, targetAweme == nil);
+    if (!currentController) {
+        return;
+    }
+
+    DYYYEnsureFloatSpeedButton(currentController);
+    DYYYApplyPlaybackSpeed(currentController, DYYYConfiguredPlaybackSpeed());
+}
+
+static void DYYYScheduleConfiguredPlaybackSpeedRestoreAfterDelay(NSTimeInterval delay) {
+    dispatch_block_t restoreBlock = ^{
+      DYYYBindAndApplyCurrentPlaybackSpeed();
+    };
+    if (delay <= 0.0) {
+        dispatch_async(dispatch_get_main_queue(), restoreBlock);
+    } else {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), restoreBlock);
+    }
+}
+
+static void DYYYScheduleConfiguredPlaybackSpeedRestore(void) {
+    DYYYScheduleConfiguredPlaybackSpeedRestoreAfterDelay(0.0);
+    DYYYScheduleConfiguredPlaybackSpeedRestoreAfterDelay(0.2);
+}
+
+static void DYYYEndLockedLongPressSpeedAndRestoreIfNeeded(void) {
+    if (!dyyyLongPressLockedSpeedActive) {
+        return;
+    }
+    dyyyLongPressLockedSpeedActive = NO;
+    DYYYScheduleConfiguredPlaybackSpeedRestore();
+}
+
+static void DYYYHandleCurrentSpeedAwemeChanged(id aweme) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          DYYYHandleCurrentSpeedAwemeChanged(aweme);
+        });
+        return;
+    }
+
+    Class awemeClass = NSClassFromString(@"AWEAwemeModel");
+    if (awemeClass && [aweme isKindOfClass:awemeClass]) {
+        dyyyCurrentSpeedAweme = (AWEAwemeModel *)aweme;
+    }
+    if (!DYYYShouldHandleSpeedFeatures()) {
+        return;
+    }
+
+    DYYYClearLongPressSpeedState();
+    DYYYRestoreFloatSpeedButtonForAwemeIfNeeded(dyyyCurrentSpeedAweme);
+
+    DYYYBindAndApplyCurrentPlaybackSpeed();
+    DYYYScheduleConfiguredPlaybackSpeedRestore();
 }
 
 @interface AWEFeedProgressSlider (DYYYProgressLabel)
@@ -462,6 +863,234 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
 
 %end
 
+// 抖音 39.1.0 访问他人主页时会由详情组件直接上传访客记录
+%hook AWEProfileUserDetailComponent
+
+- (void)reportUserDetailVisitIfNeeded:(id)user {
+    if (DYYYGetBool(@"DYYYDisableProfileVisitRecordUpload")) {
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
+// 兼容旧版访客记录上传路径
+%hook AWEProfileRecordHelper
+
++ (void)postProfileRecordWithParams:(id)params completionBlock:(id)completionBlock {
+    if (DYYYGetBool(@"DYYYDisableProfileVisitRecordUpload")) {
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
+@interface AWENowPlayingInfoCenter : NSObject
+@property(nonatomic, weak) id playingPlayer;
+@end
+
+@interface MPNowPlayingInfoCenter : NSObject
+@property(nonatomic, copy) NSDictionary *nowPlayingInfo;
++ (instancetype)defaultCenter;
+@end
+
+static BOOL dyyyClearingFeedNowPlayingSystemInfo = NO;
+static CFTimeInterval dyyyLastFeedNowPlayingSystemClearTime = 0.0;
+
+static void DYYYClearFeedNowPlayingSystemInfoThrottled(void) {
+    if (!DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo") || dyyyClearingFeedNowPlayingSystemInfo) {
+        return;
+    }
+
+    CFTimeInterval currentTime = CFAbsoluteTimeGetCurrent();
+    if (currentTime - dyyyLastFeedNowPlayingSystemClearTime < 0.25) {
+        return;
+    }
+    dyyyLastFeedNowPlayingSystemClearTime = currentTime;
+
+    Class nowPlayingInfoCenterClass = NSClassFromString(@"MPNowPlayingInfoCenter");
+    if (!nowPlayingInfoCenterClass || ![nowPlayingInfoCenterClass respondsToSelector:@selector(defaultCenter)]) {
+        return;
+    }
+
+    id center = ((id (*)(Class, SEL))objc_msgSend)(nowPlayingInfoCenterClass, @selector(defaultCenter));
+    if (!center) {
+        return;
+    }
+
+    dyyyClearingFeedNowPlayingSystemInfo = YES;
+    @try {
+        if ([center respondsToSelector:@selector(setNowPlayingInfo:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(center, @selector(setNowPlayingInfo:), nil);
+        }
+
+        SEL setPlaybackStateSelector = NSSelectorFromString(@"setPlaybackState:");
+        if ([center respondsToSelector:setPlaybackStateSelector]) {
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(center, setPlaybackStateSelector, 0);
+        }
+    } @catch (__unused NSException *exception) {
+    } @finally {
+        dyyyClearingFeedNowPlayingSystemInfo = NO;
+    }
+}
+
+static BOOL DYYYShouldBlockFeedNowPlayingSystemInfoWrite(void) {
+    return DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo") && !dyyyClearingFeedNowPlayingSystemInfo;
+}
+
+%hook AWEAwemeBackgroundPlayModule
+
+- (id)nowPlayingInfo {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return nil;
+    }
+
+    return %orig;
+}
+
+- (void)refreshNowPlayingInfoIfNeeded {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+- (void)updateNowPlayingInfoPlayback {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
+%hook AWEFeedBackgroundPlayManager
+
+- (id)nowPlayingInfo {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return nil;
+    }
+
+    return %orig;
+}
+
+- (void)setNowPlayingInfo:(id)nowPlayingInfo {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+- (void)resetNowPlayingInfo:(id)model {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+- (void)refreshNowPlayingInfo {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+- (void)refreshNowPlayingInfoIsForce:(BOOL)isForce {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+- (void)updateNowPlayingInfoPlayback {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
+// 采用 HideNowPlayingInfo 的强屏蔽思路：播放中心写入时直接清空系统 Now Playing，不再走原实现。
+%hook AWENowPlayingInfoCenter
+
+- (void)becomePlayingPlayer:(id)player {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+- (void)setNowPlayingInfo:(id)nowPlayingInfo {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+- (void)refreshNowPlayingInfo {
+    if (DYYYGetBool(@"DYYYDisableFeedNowPlayingInfo")) {
+        DYYYClearFeedNowPlayingSystemInfoThrottled();
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
+// 耳机或系统媒体会话可能绕过抖音播放中心，最终都要写入 MPNowPlayingInfoCenter。
+%hook MPNowPlayingInfoCenter
+
+- (void)setNowPlayingInfo:(NSDictionary *)nowPlayingInfo {
+    if (DYYYShouldBlockFeedNowPlayingSystemInfoWrite()) {
+        %orig(nil);
+        return;
+    }
+
+    %orig;
+}
+
+- (void)setPlaybackState:(NSInteger)playbackState {
+    if (DYYYShouldBlockFeedNowPlayingSystemInfoWrite()) {
+        %orig(0);
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
+static BOOL DYYYShouldDisableAllHDR(void);
+static NSArray *DYYYFilteredSDRBitrateModels(NSArray *models);
+static NSArray *DYYYFilteredSDRRawBitrateData(NSArray *rawData);
+static void DYYYStripHDRHintsFromBitrateModels(NSArray *models);
+
 // 默认视频流最高画质
 %hook AWEVideoModel
 
@@ -513,6 +1142,12 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
 
     NSArray *originalModels = %orig;
 
+    if (DYYYShouldDisableAllHDR()) {
+        NSArray *filteredModels = DYYYFilteredSDRBitrateModels(originalModels);
+        DYYYStripHDRHintsFromBitrateModels(filteredModels);
+        originalModels = filteredModels;
+    }
+
     if (!DYYYGetBool(@"DYYYEnableVideoHighestQuality")) {
         return originalModels;
     }
@@ -551,6 +1186,1410 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
     }
 
     return originalModels;
+}
+
+- (void)setBitrateModels:(NSArray *)bitrateModels {
+    if (DYYYShouldDisableAllHDR()) {
+        NSArray *filteredModels = DYYYFilteredSDRBitrateModels(bitrateModels);
+        DYYYStripHDRHintsFromBitrateModels(filteredModels);
+        %orig(filteredModels);
+        return;
+    }
+    %orig;
+}
+
+- (void)setManualBitrateModels:(NSArray *)manualBitrateModels {
+    if (DYYYShouldDisableAllHDR()) {
+        NSArray *filteredModels = DYYYFilteredSDRBitrateModels(manualBitrateModels);
+        DYYYStripHDRHintsFromBitrateModels(filteredModels);
+        %orig(filteredModels);
+        return;
+    }
+    %orig;
+}
+
+- (NSArray *)manualBitrateModels {
+    NSArray *models = %orig;
+    if (DYYYShouldDisableAllHDR()) {
+        models = DYYYFilteredSDRBitrateModels(models);
+        DYYYStripHDRHintsFromBitrateModels(models);
+    }
+    return models;
+}
+
+- (void)setBitrateRawData:(NSArray *)bitrateRawData {
+    if (DYYYShouldDisableAllHDR()) {
+        %orig(DYYYFilteredSDRRawBitrateData(bitrateRawData));
+        return;
+    }
+    %orig;
+}
+
+- (NSArray *)bitrateRawData {
+    NSArray *rawData = %orig;
+    if (DYYYShouldDisableAllHDR()) {
+        rawData = DYYYFilteredSDRRawBitrateData(rawData);
+    }
+    return rawData;
+}
+
+- (void)setHasFilterHDR:(BOOL)hasFilterHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : hasFilterHDR);
+}
+
+- (BOOL)hasFilterHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setIsSourceHDR:(NSInteger)isSourceHDR {
+    %orig(DYYYShouldDisableAllHDR() ? 0 : isSourceHDR);
+}
+
+- (NSInteger)isSourceHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return 0;
+    }
+    return %orig;
+}
+
+%end
+
+static NSString *const kDYYYHDRModeKey = @"DYYYHDRMode";
+static NSString *const kDYYYHDRModeOff = @"关闭";
+static NSString *const kDYYYHDRModeDisable = @"全局屏蔽HDR效果";
+static NSString *const kDYYYHDRModeFilter = @"全局过滤HDR作品";
+static char kDYYYHDRStrippedAwemeModelKey;
+static char kDYYYHDRStrippedVideoModelKey;
+static char kDYYYHDROnlyAwemeModelKey;
+static char kDYYYHDROnlyVideoModelKey;
+
+static void DYYYMigrateCombinedHDRModeIfNeeded(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        if ([defaults boolForKey:@"DYYYHDRModeMigratedV1"]) {
+            return;
+        }
+
+        NSString *mode = [defaults stringForKey:kDYYYHDRModeKey];
+        BOOL hasValidMode = [mode isEqualToString:kDYYYHDRModeOff] ||
+                            [mode isEqualToString:kDYYYHDRModeDisable] ||
+                            [mode isEqualToString:kDYYYHDRModeFilter];
+        if (!hasValidMode) {
+            if ([defaults boolForKey:@"DYYYDisableAllHDR"]) {
+                mode = kDYYYHDRModeDisable;
+            } else if ([defaults boolForKey:@"DYYYFilterFeedHDR"]) {
+                mode = kDYYYHDRModeFilter;
+            } else {
+                mode = kDYYYHDRModeOff;
+            }
+        }
+
+        [defaults setObject:mode forKey:kDYYYHDRModeKey];
+        [defaults removeObjectForKey:@"DYYYDisableAllHDR"];
+        [defaults removeObjectForKey:@"DYYYFilterFeedHDR"];
+        [defaults setBool:YES forKey:@"DYYYHDRModeMigratedV1"];
+    });
+}
+
+static BOOL DYYYShouldDisableAllHDR(void) {
+    return [[[NSUserDefaults standardUserDefaults] stringForKey:kDYYYHDRModeKey] isEqualToString:kDYYYHDRModeDisable];
+}
+
+static BOOL DYYYShouldFilterGlobalHDR(void) {
+    return [[[NSUserDefaults standardUserDefaults] stringForKey:kDYYYHDRModeKey] isEqualToString:kDYYYHDRModeFilter];
+}
+
+static id DYYYKVCValueIfPossible(id object, NSString *key) {
+    if (!object || key.length == 0) {
+        return nil;
+    }
+
+    @try {
+        return [object valueForKey:key];
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static void DYYYSetKVCValueIfPossible(id object, NSString *key, id value) {
+    if (!object || key.length == 0) {
+        return;
+    }
+
+    @try {
+        [object setValue:value forKey:key];
+    } @catch (__unused NSException *exception) {
+    }
+}
+
+static id DYYYIvarValueIfPossible(id object, const char *ivarName) {
+    if (!object || !ivarName) {
+        return nil;
+    }
+
+    Class cls = object_getClass(object);
+    while (cls) {
+        Ivar ivar = class_getInstanceVariable(cls, ivarName);
+        if (ivar) {
+            return object_getIvar(object, ivar);
+        }
+        cls = class_getSuperclass(cls);
+    }
+
+    return nil;
+}
+
+static id DYYYValuePreferringIvar(id object, const char *ivarName, NSString *key) {
+    id ivarValue = DYYYIvarValueIfPossible(object, ivarName);
+    if (ivarValue) {
+        return ivarValue;
+    }
+    return DYYYKVCValueIfPossible(object, key);
+}
+
+static NSInteger DYYYIntegerValueForKeyIfPossible(id object, NSString *key, NSInteger fallback) {
+    id value = DYYYKVCValueIfPossible(object, key);
+    if ([value respondsToSelector:@selector(integerValue)]) {
+        return [value integerValue];
+    }
+    return fallback;
+}
+
+static BOOL DYYYStringValueLooksHDR(id value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return NO;
+    }
+
+    NSString *lowercaseValue = [(NSString *)value lowercaseString];
+    return [lowercaseValue containsString:@"hdr"] ||
+           [lowercaseValue containsString:@"hlg"] ||
+           [lowercaseValue containsString:@"dolby"] ||
+           [lowercaseValue containsString:@"vivid"] ||
+           [lowercaseValue isEqualToString:@"pq"] ||
+           [lowercaseValue containsString:@"_pq"] ||
+           [lowercaseValue containsString:@"pq_"];
+}
+
+static BOOL DYYYRawBitrateDictionaryLooksHDR(NSDictionary *dictionary);
+
+static BOOL DYYYBitrateModelLooksHDR(id bitrateModel) {
+    if (!bitrateModel) {
+        return NO;
+    }
+
+    if ([bitrateModel isKindOfClass:[NSDictionary class]]) {
+        return DYYYRawBitrateDictionaryLooksHDR((NSDictionary *)bitrateModel);
+    }
+
+    id hdrTypeValue = DYYYKVCValueIfPossible(bitrateModel, @"hdrType");
+    id hdrBitValue = DYYYKVCValueIfPossible(bitrateModel, @"hdrBit");
+    NSInteger hdrType = DYYYIntegerValueForKeyIfPossible(bitrateModel, @"hdrType", 0);
+    NSInteger hdrBit = DYYYIntegerValueForKeyIfPossible(bitrateModel, @"hdrBit", 0);
+    BOOL hasHdrType = DYYYIntegerValueForKeyIfPossible(bitrateModel, @"hasHdrType", 0) > 0;
+    BOOL hasHdrBit = DYYYIntegerValueForKeyIfPossible(bitrateModel, @"hasHdrBit", 0) > 0;
+
+    return hdrType > 0 ||
+           hdrBit >= 10 ||
+           hasHdrType ||
+           hasHdrBit ||
+           DYYYStringValueLooksHDR(hdrTypeValue) ||
+           DYYYStringValueLooksHDR(hdrBitValue);
+}
+
+static BOOL DYYYStringKeyLooksVideoBitrateList(NSString *key) {
+    NSString *lowercaseKey = key.lowercaseString;
+    if (lowercaseKey.length == 0 || [lowercaseKey containsString:@"audio"]) {
+        return NO;
+    }
+
+    return [lowercaseKey containsString:@"bit_rate"] ||
+           [lowercaseKey containsString:@"bitrate"] ||
+           [lowercaseKey containsString:@"bit_rate_model"] ||
+           [lowercaseKey containsString:@"bitratemodel"];
+}
+
+static BOOL DYYYRawBitrateDictionaryLooksHDR(NSDictionary *dictionary) {
+    if (![dictionary isKindOfClass:[NSDictionary class]]) {
+        return NO;
+    }
+
+    for (id rawKey in dictionary) {
+        id value = dictionary[rawKey];
+        NSString *key = [[rawKey description] lowercaseString];
+        NSInteger numericValue = [value respondsToSelector:@selector(integerValue)] ? [value integerValue] : 0;
+
+        if (([key isEqualToString:@"hdr_type"] ||
+             [key isEqualToString:@"hdrtype"] ||
+             [key isEqualToString:@"videohdrtype"] ||
+             [key isEqualToString:@"video_hdr_type"] ||
+             [key isEqualToString:@"source_hdr_type"]) && numericValue > 0) {
+            return YES;
+        }
+
+        if (([key isEqualToString:@"hdr_bit"] ||
+             [key isEqualToString:@"hdrbit"] ||
+             [key isEqualToString:@"bit_depth"] ||
+             [key isEqualToString:@"bitdepth"]) && numericValue >= 10) {
+            return YES;
+        }
+
+        if (([key isEqualToString:@"is_source_hdr"] ||
+             [key isEqualToString:@"source_hdr"] ||
+             [key isEqualToString:@"is_hdr"] ||
+             [key isEqualToString:@"ishdr"] ||
+             [key isEqualToString:@"has_hdr"] ||
+             [key isEqualToString:@"hashdr"] ||
+             [key isEqualToString:@"has_filter_hdr"] ||
+             [key isEqualToString:@"filter_hdr"] ||
+             [key isEqualToString:@"has_hdr_type"] ||
+             [key isEqualToString:@"hashdrtype"] ||
+             [key isEqualToString:@"has_hdr_bit"] ||
+             [key isEqualToString:@"hashdrbit"]) && numericValue > 0) {
+            return YES;
+        }
+
+        if (DYYYStringValueLooksHDR(value)) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static void DYYYCollectRawBitrateHDRStatus(id object, NSUInteger depth, BOOL *foundHDRBitrate, BOOL *foundSDRBitrate) {
+    if (!object || depth > 8 || (foundSDRBitrate && *foundSDRBitrate)) {
+        return;
+    }
+
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dictionary = (NSDictionary *)object;
+        for (id rawKey in dictionary) {
+            id value = dictionary[rawKey];
+            NSString *key = [rawKey description];
+
+            if (DYYYStringKeyLooksVideoBitrateList(key) && [value isKindOfClass:[NSArray class]]) {
+                for (id entry in (NSArray *)value) {
+                    if (![entry isKindOfClass:[NSDictionary class]]) {
+                        continue;
+                    }
+
+                    if (DYYYRawBitrateDictionaryLooksHDR((NSDictionary *)entry)) {
+                        if (foundHDRBitrate) {
+                            *foundHDRBitrate = YES;
+                        }
+                    } else if (foundSDRBitrate) {
+                        *foundSDRBitrate = YES;
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            if ([value isKindOfClass:[NSDictionary class]] || [value isKindOfClass:[NSArray class]]) {
+                DYYYCollectRawBitrateHDRStatus(value, depth + 1, foundHDRBitrate, foundSDRBitrate);
+            }
+        }
+    } else if ([object isKindOfClass:[NSArray class]]) {
+        for (id value in (NSArray *)object) {
+            DYYYCollectRawBitrateHDRStatus(value, depth + 1, foundHDRBitrate, foundSDRBitrate);
+        }
+    }
+}
+
+static BOOL DYYYRawObjectHasOnlyHDRBitrateModels(id object) {
+    BOOL foundHDRBitrate = NO;
+    BOOL foundSDRBitrate = NO;
+    DYYYCollectRawBitrateHDRStatus(object, 0, &foundHDRBitrate, &foundSDRBitrate);
+    return foundHDRBitrate && !foundSDRBitrate;
+}
+
+static BOOL DYYYVideoModelHasOnlyHDRBitrateModels(id video) {
+    if (!video) {
+        return NO;
+    }
+
+    NSNumber *cachedResult = objc_getAssociatedObject(video, &kDYYYHDROnlyVideoModelKey);
+    if (cachedResult) {
+        return cachedResult.boolValue;
+    }
+
+    NSMutableArray *models = [NSMutableArray array];
+    NSArray *bitrateModels = DYYYValuePreferringIvar(video, "_bitrateModels", @"bitrateModels");
+    if ([bitrateModels isKindOfClass:[NSArray class]]) {
+        [models addObjectsFromArray:bitrateModels];
+    }
+
+    NSArray *manualBitrateModels = DYYYValuePreferringIvar(video, "_manualBitrateModels", @"manualBitrateModels");
+    if ([manualBitrateModels isKindOfClass:[NSArray class]]) {
+        [models addObjectsFromArray:manualBitrateModels];
+    }
+
+    NSArray *bitrateRawData = DYYYValuePreferringIvar(video, "_bitrateRawData", @"bitrateRawData");
+    if ([bitrateRawData isKindOfClass:[NSArray class]]) {
+        [models addObjectsFromArray:bitrateRawData];
+    }
+
+    if (models.count == 0) {
+        return NO;
+    }
+
+    BOOL onlyHDR = YES;
+    for (id model in models) {
+        if (!DYYYBitrateModelLooksHDR(model)) {
+            onlyHDR = NO;
+            break;
+        }
+    }
+
+    objc_setAssociatedObject(video, &kDYYYHDROnlyVideoModelKey, @(onlyHDR), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return onlyHDR;
+}
+
+static BOOL DYYYAwemeModelHasOnlyHDRBitrateModels(id aweme) {
+    if (!aweme) {
+        return NO;
+    }
+
+    NSNumber *cachedResult = objc_getAssociatedObject(aweme, &kDYYYHDROnlyAwemeModelKey);
+    if (cachedResult) {
+        return cachedResult.boolValue;
+    }
+
+    BOOL onlyHDR = NO;
+    BOOL shouldCacheResult = NO;
+    id video = DYYYValuePreferringIvar(aweme, "_video", @"video");
+    if (video) {
+        shouldCacheResult = YES;
+    }
+    if (DYYYVideoModelHasOnlyHDRBitrateModels(video)) {
+        onlyHDR = YES;
+    } else {
+        NSArray *albumImages = DYYYValuePreferringIvar(aweme, "_albumImages", @"albumImages");
+        if ([albumImages isKindOfClass:[NSArray class]]) {
+            shouldCacheResult = shouldCacheResult || albumImages.count > 0;
+            for (id imageModel in albumImages) {
+                id clipVideo = DYYYValuePreferringIvar(imageModel, "_clipVideo", @"clipVideo");
+                if (DYYYVideoModelHasOnlyHDRBitrateModels(clipVideo)) {
+                    onlyHDR = YES;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (shouldCacheResult || onlyHDR) {
+        objc_setAssociatedObject(aweme, &kDYYYHDROnlyAwemeModelKey, @(onlyHDR), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return onlyHDR;
+}
+
+static NSArray *DYYYFilteredSDRRawBitrateData(NSArray *rawData) {
+    if (![rawData isKindOfClass:[NSArray class]] || rawData.count == 0) {
+        return rawData;
+    }
+
+    NSMutableArray *sdrData = [NSMutableArray arrayWithCapacity:rawData.count];
+    NSUInteger hdrCount = 0;
+    for (id entry in rawData) {
+        if ([entry isKindOfClass:[NSDictionary class]] && DYYYRawBitrateDictionaryLooksHDR((NSDictionary *)entry)) {
+            hdrCount++;
+            continue;
+        }
+        [sdrData addObject:entry];
+    }
+
+    if (hdrCount == 0 || sdrData.count == 0) {
+        return rawData;
+    }
+
+    return [sdrData copy];
+}
+
+static NSArray *DYYYFilteredSDRBitrateModels(NSArray *models) {
+    if (![models isKindOfClass:[NSArray class]] || models.count == 0) {
+        return models;
+    }
+
+    NSMutableArray *sdrModels = [NSMutableArray arrayWithCapacity:models.count];
+    NSUInteger hdrCount = 0;
+    for (id model in models) {
+        if (DYYYBitrateModelLooksHDR(model)) {
+            hdrCount++;
+            continue;
+        }
+        [sdrModels addObject:model];
+    }
+
+    // 只有 HDR 档的作品在模型层过滤；这里不清空列表，避免播放器拿不到可播档导致有声黑屏。
+    if (hdrCount == 0 || sdrModels.count == 0) {
+        return models;
+    }
+
+    return [sdrModels copy];
+}
+
+static void DYYYStripHDRHintsFromBitrateModels(NSArray *models) {
+    if (![models isKindOfClass:[NSArray class]]) {
+        return;
+    }
+
+    for (id model in models) {
+        DYYYSetKVCValueIfPossible(model, @"hdrType", @0);
+        DYYYSetKVCValueIfPossible(model, @"hdrBit", @8);
+        DYYYSetKVCValueIfPossible(model, @"hasHdrType", @NO);
+        DYYYSetKVCValueIfPossible(model, @"hasHdrBit", @NO);
+    }
+}
+
+static void DYYYStripHDRHintsFromVideoModel(id video) {
+    if (!DYYYShouldDisableAllHDR() || !video) {
+        return;
+    }
+
+    if (objc_getAssociatedObject(video, &kDYYYHDRStrippedVideoModelKey)) {
+        return;
+    }
+    objc_setAssociatedObject(video, &kDYYYHDRStrippedVideoModelKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    if ([video respondsToSelector:@selector(setIsSourceHDR:)]) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(video, @selector(setIsSourceHDR:), 0);
+    }
+    if ([video respondsToSelector:@selector(setHasFilterHDR:)]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(video, @selector(setHasFilterHDR:), NO);
+    }
+
+    NSArray *bitrateModels = DYYYKVCValueIfPossible(video, @"bitrateModels");
+    NSArray *filteredBitrateModels = DYYYFilteredSDRBitrateModels(bitrateModels);
+    if (filteredBitrateModels && filteredBitrateModels != bitrateModels) {
+        DYYYSetKVCValueIfPossible(video, @"bitrateModels", filteredBitrateModels);
+        bitrateModels = filteredBitrateModels;
+    }
+    DYYYStripHDRHintsFromBitrateModels(bitrateModels);
+
+    NSArray *manualBitrateModels = DYYYKVCValueIfPossible(video, @"manualBitrateModels");
+    NSArray *filteredManualBitrateModels = DYYYFilteredSDRBitrateModels(manualBitrateModels);
+    if (filteredManualBitrateModels && filteredManualBitrateModels != manualBitrateModels) {
+        DYYYSetKVCValueIfPossible(video, @"manualBitrateModels", filteredManualBitrateModels);
+        manualBitrateModels = filteredManualBitrateModels;
+    }
+    DYYYStripHDRHintsFromBitrateModels(manualBitrateModels);
+
+    NSArray *bitrateRawData = DYYYValuePreferringIvar(video, "_bitrateRawData", @"bitrateRawData");
+    NSArray *filteredBitrateRawData = DYYYFilteredSDRRawBitrateData(bitrateRawData);
+    if (filteredBitrateRawData && filteredBitrateRawData != bitrateRawData) {
+        DYYYSetKVCValueIfPossible(video, @"bitrateRawData", filteredBitrateRawData);
+    }
+}
+
+static void DYYYStripHDRHintsFromAwemeModel(id aweme) {
+    if (!DYYYShouldDisableAllHDR() || !aweme) {
+        return;
+    }
+
+    if (objc_getAssociatedObject(aweme, &kDYYYHDRStrippedAwemeModelKey)) {
+        return;
+    }
+    objc_setAssociatedObject(aweme, &kDYYYHDRStrippedAwemeModelKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    id video = DYYYValuePreferringIvar(aweme, "_video", @"video");
+    DYYYStripHDRHintsFromVideoModel(video);
+
+    NSArray *albumImages = DYYYValuePreferringIvar(aweme, "_albumImages", @"albumImages");
+    if ([albumImages isKindOfClass:[NSArray class]]) {
+        for (id imageModel in albumImages) {
+            DYYYStripHDRHintsFromVideoModel(DYYYValuePreferringIvar(imageModel, "_clipVideo", @"clipVideo"));
+        }
+    }
+}
+
+static id DYYYStandardCADynamicRange(void) {
+    static id standardDynamicRange = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *symbol = dlsym(RTLD_DEFAULT, "CADynamicRangeStandard");
+        if (symbol) {
+            id __unsafe_unretained *value = (id __unsafe_unretained *)symbol;
+            standardDynamicRange = *value;
+        }
+    });
+    return standardDynamicRange;
+}
+
+static id DYYYToneMapModeIfSupported(void) {
+    static id toneMapMode = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *symbol = dlsym(RTLD_DEFAULT, "CAToneMapModeIfSupported");
+        if (symbol) {
+            id __unsafe_unretained *value = (id __unsafe_unretained *)symbol;
+            toneMapMode = *value;
+        }
+    });
+    return toneMapMode;
+}
+
+static void DYYYApplySDRDynamicRangeToImageView(UIImageView *imageView) {
+    if (!DYYYShouldDisableAllHDR() || !imageView) {
+        return;
+    }
+
+    if (@available(iOS 17.0, *)) {
+        imageView.preferredImageDynamicRange = UIImageDynamicRangeStandard;
+    }
+}
+
+static void DYYYDisableExtendedRangeForLayer(CALayer *layer) {
+    if (!DYYYShouldDisableAllHDR() || !layer) {
+        return;
+    }
+
+    SEL setWantsEDRSelector = @selector(setWantsExtendedDynamicRangeContent:);
+    if ([layer respondsToSelector:setWantsEDRSelector]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(layer, setWantsEDRSelector, NO);
+    }
+
+    id toneMapMode = DYYYToneMapModeIfSupported();
+    SEL setToneMapModeSelector = @selector(setToneMapMode:);
+    if (toneMapMode && [layer respondsToSelector:setToneMapModeSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(layer, setToneMapModeSelector, toneMapMode);
+    }
+
+    id standardDynamicRange = DYYYStandardCADynamicRange();
+    SEL setPreferredDynamicRangeSelector = @selector(setPreferredDynamicRange:);
+    if (standardDynamicRange && [layer respondsToSelector:setPreferredDynamicRangeSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(layer, setPreferredDynamicRangeSelector, standardDynamicRange);
+    }
+
+    if (@available(iOS 16.0, *)) {
+        if ([layer isKindOfClass:[CAMetalLayer class]]) {
+            ((CAMetalLayer *)layer).EDRMetadata = nil;
+        }
+    }
+}
+
+static void DYYYDisableExtendedRangeForMetalLayer(CAMetalLayer *metalLayer) {
+    if (!DYYYShouldDisableAllHDR() || !metalLayer) {
+        return;
+    }
+
+    DYYYDisableExtendedRangeForLayer(metalLayer);
+}
+
+static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
+    if (!DYYYShouldDisableAllHDR() || !item) {
+        return;
+    }
+
+    if (@available(iOS 14.0, *)) {
+        item.appliesPerFrameHDRDisplayMetadata = NO;
+    }
+}
+
+// 保留 HDR 解码及原生 HDR -> SDR 转换，只关闭亮度增强、SDR -> HDR 和最终 EDR 输出。
+
+%hook AVPlayer
+
++ (AVPlayerHDRMode)availableHDRModes {
+    if (DYYYShouldDisableAllHDR()) {
+        return 0;
+    }
+    return %orig;
+}
+
++ (BOOL)eligibleForHDRPlayback {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (instancetype)playerWithURL:(NSURL *)URL {
+    AVPlayer *player = %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(player.currentItem);
+    return player;
+}
+
++ (instancetype)playerWithPlayerItem:(AVPlayerItem *)item {
+    DYYYDisableAVPlayerItemHDRMetadata(item);
+    return %orig;
+}
+
+- (instancetype)initWithURL:(NSURL *)URL {
+    self = %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(self.currentItem);
+    return self;
+}
+
+- (instancetype)initWithPlayerItem:(AVPlayerItem *)item {
+    DYYYDisableAVPlayerItemHDRMetadata(item);
+    return %orig;
+}
+
+- (void)replaceCurrentItemWithPlayerItem:(AVPlayerItem *)item {
+    DYYYDisableAVPlayerItemHDRMetadata(item);
+    %orig;
+}
+
+%end
+
+%hook AVPlayerItem
+
++ (instancetype)playerItemWithURL:(NSURL *)URL {
+    AVPlayerItem *item = %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(item);
+    return item;
+}
+
++ (instancetype)playerItemWithAsset:(AVAsset *)asset {
+    AVPlayerItem *item = %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(item);
+    return item;
+}
+
++ (instancetype)playerItemWithAsset:(AVAsset *)asset automaticallyLoadedAssetKeys:(NSArray<NSString *> *)automaticallyLoadedAssetKeys {
+    AVPlayerItem *item = %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(item);
+    return item;
+}
+
+- (instancetype)initWithURL:(NSURL *)URL {
+    self = %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(self);
+    return self;
+}
+
+- (instancetype)initWithAsset:(AVAsset *)asset {
+    self = %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(self);
+    return self;
+}
+
+- (instancetype)initWithAsset:(AVAsset *)asset automaticallyLoadedAssetKeys:(NSArray<NSString *> *)automaticallyLoadedAssetKeys {
+    self = %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(self);
+    return self;
+}
+
+- (void)setAppliesPerFrameHDRDisplayMetadata:(BOOL)appliesPerFrameHDRDisplayMetadata {
+    %orig(DYYYShouldDisableAllHDR() ? NO : appliesPerFrameHDRDisplayMetadata);
+}
+
+- (BOOL)appliesPerFrameHDRDisplayMetadata {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook AVPlayerLayer
+
+- (void)setPlayer:(AVPlayer *)player {
+    DYYYDisableAVPlayerItemHDRMetadata(player.currentItem);
+    %orig;
+    DYYYDisableExtendedRangeForLayer(self);
+}
+
+- (void)layoutSublayers {
+    %orig;
+    DYYYDisableAVPlayerItemHDRMetadata(self.player.currentItem);
+    DYYYDisableExtendedRangeForLayer(self);
+}
+
+%end
+
+%hook AWEKnowledgeABTestSettings
+
++ (BOOL)enableHDRAutomaticIdentification {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook AWEFeedABSettings
+
++ (BOOL)enableHDRBrightnessOpt {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)enableProfilePreloadHDRBrightnessFilter {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)enableDynamicGaussianBlurHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)enableHDRFullModelAdaptation {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)hdrAutomaticIdentification {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook AWEFeedABTestServiceObjc
+
++ (BOOL)enableProfilePreloadHDRBrightnessFilter {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook BDSimPlayerBizConfig
+
+- (BOOL)enableHDRBrightnessOpt {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)enableHDRFullModelAdaptation {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)hdrAutomaticIdentification {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook AWEBDSimPlayerBizConfig
+
+- (BOOL)enableHDRBrightnessOpt {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)enableHDRFullModelAdaptation {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)hdrAutomaticIdentification {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook AWEVideoPlayerConfiguration
+
++ (void)setHDRBrightnessStrategy:(id)strategy {
+    if (!DYYYShouldDisableAllHDR()) {
+        %orig;
+    }
+}
+
++ (double)getHDRBrightnessOffset:(id)configuration brightness:(double)brightness {
+    if (DYYYShouldDisableAllHDR()) {
+        return 0.0;
+    }
+    return %orig;
+}
+
+%end
+
+%hook AWEDPlayerVideoDisplayOptState
+
+- (BOOL)enableHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setEnableHDR:(BOOL)enableHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enableHDR);
+}
+
+%end
+
+%hook AWEPlayVideoPlayerContext
+
+- (BOOL)enableHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setEnableHDR:(BOOL)enableHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enableHDR);
+}
+
+%end
+
+%hook AWEDPlayerVideoModel
+
+- (BOOL)awe_isHDRVideo {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setAwe_isHDRVideo:(BOOL)awe_isHDRVideo {
+    %orig(DYYYShouldDisableAllHDR() ? NO : awe_isHDRVideo);
+}
+
+%end
+
+%hook AWEPlayVideoViewController
+
+- (BOOL)enableHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setEnableHDR:(BOOL)enableHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enableHDR);
+}
+
+- (BOOL)awe_isCurrentVideoHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setPlayerLutFilter:(id)lutFilter HDRLutImage:(id)HDRLutImage {
+    %orig(lutFilter, DYYYShouldDisableAllHDR() ? nil : HDRLutImage);
+}
+
+%end
+
+%hook AWEDPlayerBrightnessContainer
+
+- (BOOL)awe_isCurrentVideoHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook AWEVideoPlayerScreenBrightnessManager
+
+- (BOOL)isHDRVideo {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setIsHDRVideo:(BOOL)isHDRVideo {
+    // 播放器复用时会重新写入当前作品的 HDR 状态，需同时清除写入值和读取结果。
+    %orig(DYYYShouldDisableAllHDR() ? NO : isHDRVideo);
+}
+
+%end
+
+%hook ALMOwnPlayerWrapper
+
+- (void)setLutFilter:(id)lutFilter HDRLutImage:(id)HDRLutImage {
+    %orig(lutFilter, DYYYShouldDisableAllHDR() ? nil : HDRLutImage);
+}
+
+%end
+
+%hook ALMSysPlayerWrapper
+
+- (void)setLutFilter:(id)lutFilter HDRLutImage:(id)HDRLutImage {
+    %orig(lutFilter, DYYYShouldDisableAllHDR() ? nil : HDRLutImage);
+}
+
+%end
+
+%hook ALMVideoPlayerConfig
+
++ (void)setPlayerEffectHDRLutImageEnable:(BOOL)enable {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enable);
+}
+
+%end
+
+%hook IESVideoPlayerConfig
+
++ (void)setPlayerEffectHDRLutImageEnable:(BOOL)enable {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enable);
+}
+
+%end
+
+%hook AWEIMModuleService
+
+- (BOOL)im_forceHDRToSDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return YES;
+    }
+    return %orig;
+}
+
+%end
+
+%hook IESIMVideoPlayerWrapper
+
+- (void)setupHDREnable:(BOOL)enable {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enable);
+}
+
+%end
+
+%hook AWEIMVideoBrowserCollectionViewCell
+
+- (void)setEnablePlayHDR:(BOOL)enable {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enable);
+}
+
+%end
+
+%hook AWEECOMIMAppSettingsService
+
++ (BOOL)enableVideoPreviewSupportHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook IESLiveAudienceHDRController
+
++ (BOOL)currentHDRStatusForRoomID:(id)roomID {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)isCurrentRoomSupportHDR:(id)roomID roomModel:(id)roomModel {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)isFeedCanEnableHDRFeature {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)isInnerFeedCanEnableHDRFeature {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)isUserEnableHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (BOOL)p_isHDRFeatureEnable {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
++ (void)setUserEnableHDR:(BOOL)enableHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enableHDR);
+}
+
++ (BOOL)shouldShowHDRSwitchForRoom:(id)room {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook IESLivePlayerController
+
+- (BOOL)isVideoSDR2HDRSupport {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setEnableVideoSDR2HDR:(BOOL)enable callTrace:(id)callTrace {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enable, callTrace);
+}
+
+- (BOOL)enableCloseSDR2HDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return YES;
+    }
+    return %orig;
+}
+
+%end
+
+%hook AWELivePreStreamPlayer
+
+- (void)changeSDR2HDRWithStrategy {
+    if (!DYYYShouldDisableAllHDR()) {
+        %orig;
+    }
+}
+
+%end
+
+%hook HTSLiveStreamPlayer
+
+- (void)setEnableVideoSDR2HDR:(BOOL)enable callTrace:(id)callTrace {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enable, callTrace);
+}
+
+- (void)changeSDR2HDRWithStrategy {
+    if (!DYYYShouldDisableAllHDR()) {
+        %orig;
+    }
+}
+
+%end
+
+%hook IESLiveStreamPlayerVideoAudioEffectPlugin
+
+- (void)setEnableVideoSDR2HDR:(BOOL)enable callTrace:(id)callTrace {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enable, callTrace);
+}
+
+- (void)changeSDR2HDRWithStrategy {
+    if (!DYYYShouldDisableAllHDR()) {
+        %orig;
+    }
+}
+
+%end
+
+%hook TVLManager
+
+- (BOOL)shouldForbidHDR10Render {
+    if (DYYYShouldDisableAllHDR()) {
+        return YES;
+    }
+    return %orig;
+}
+
+- (void)setShouldForbidHDR10Render:(BOOL)shouldForbid {
+    %orig(DYYYShouldDisableAllHDR() ? YES : shouldForbid);
+}
+
+- (void)setupVideoSDR2HDR:(id)config {
+    if (!DYYYShouldDisableAllHDR()) {
+        %orig;
+    }
+}
+
+%end
+
+%hook TVLPlayerItemPreferences
+
+- (BOOL)forbidSDR2HDRInPreview {
+    if (DYYYShouldDisableAllHDR()) {
+        return YES;
+    }
+    return %orig;
+}
+
+- (void)setForbidSDR2HDRInPreview:(BOOL)forbid {
+    %orig(DYYYShouldDisableAllHDR() ? YES : forbid);
+}
+
+- (BOOL)enableUseSDR2HDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setEnableUseSDR2HDR:(BOOL)enable {
+    %orig(DYYYShouldDisableAllHDR() ? NO : enable);
+}
+
+%end
+
+%hook TVLSettingsManager
+
+- (BOOL)enableMetalRenderHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook IESFiltersManager
+
+- (void)setHDRIndensity:(double)intensity {
+    %orig(DYYYShouldDisableAllHDR() ? 0.0 : intensity);
+}
+
+%end
+
+%hook BDImageDecoderFactory
+
++ (BOOL)isHDRImageData:(id)data withHeifDecoderClass:(Class)decoderClass {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook BDImageDecoderImageIO
+
+- (BOOL)isHDRCGImage:(CGImageRef)image decodedToHDR:(BOOL)decodedToHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (id)hdrOptionsFor:(id)image decodedToHDR:(BOOL *)decodedToHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        if (decodedToHDR) {
+            *decodedToHDR = NO;
+        }
+        return nil;
+    }
+    return %orig;
+}
+
+%end
+
+%hook BDImageDecoderHeic
+
++ (BOOL)isHDRData:(id)data {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)isHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setIsHDR:(BOOL)isHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : isHDR);
+}
+
+%end
+
+%hook BDImageDecoderBVC2
+
+- (BOOL)isHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setIsHDR:(BOOL)isHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : isHDR);
+}
+
+%end
+
+%hook BDImageDecoderWebP
+
+- (BOOL)isHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setIsHDR:(BOOL)isHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : isHDR);
+}
+
+%end
+
+%hook BDImage
+
+- (BOOL)isHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setIsHDR:(BOOL)isHDR {
+    %orig(DYYYShouldDisableAllHDR() ? NO : isHDR);
+}
+
+%end
+
+%hook HDRMTUIImageView
+
+- (instancetype)initWithFrame:(CGRect)frame hdrEnabled:(BOOL)hdrEnabled {
+    return %orig(frame, DYYYShouldDisableAllHDR() ? NO : hdrEnabled);
+}
+
+- (BOOL)hdrEnabled {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setHdrEnabled:(BOOL)hdrEnabled {
+    %orig(DYYYShouldDisableAllHDR() ? NO : hdrEnabled);
+}
+
+- (void)setImage:(UIImage *)image {
+    if (DYYYShouldDisableAllHDR()) {
+        self.hdrEnabled = NO;
+    }
+    DYYYApplySDRDynamicRangeToImageView(self);
+    %orig;
+    DYYYApplySDRDynamicRangeToImageView(self);
+}
+
+%end
+
+%hook HDRMTImageView
+
+- (void)setMetalLayer:(CAMetalLayer *)metalLayer {
+    %orig;
+    DYYYDisableExtendedRangeForMetalLayer(metalLayer);
+}
+
+- (void)setUpEnv {
+    %orig;
+    DYYYDisableExtendedRangeForMetalLayer(self.metalLayer);
+}
+
+- (void)layoutSubviews {
+    %orig;
+    DYYYDisableExtendedRangeForMetalLayer(self.metalLayer);
+}
+
+%end
+
+%hook HDRMTButton
+
+- (void)configHDRContent {
+    %orig;
+    DYYYApplySDRDynamicRangeToImageView(self.hdrmtImageView);
+}
+
+%end
+
+%hook CAMetalLayer
+
+- (void)setWantsExtendedDynamicRangeContent:(BOOL)wantsExtendedDynamicRangeContent {
+    %orig(DYYYShouldDisableAllHDR() ? NO : wantsExtendedDynamicRangeContent);
+}
+
+- (BOOL)wantsExtendedDynamicRangeContent {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setEDRMetadata:(CAEDRMetadata *)EDRMetadata {
+    %orig(DYYYShouldDisableAllHDR() ? nil : EDRMetadata);
+}
+
+- (CAEDRMetadata *)EDRMetadata {
+    if (DYYYShouldDisableAllHDR()) {
+        return nil;
+    }
+    return %orig;
+}
+
+%end
+
+%hook CALayer
+
+- (void)setWantsExtendedDynamicRangeContent:(BOOL)wantsExtendedDynamicRangeContent {
+    %orig(DYYYShouldDisableAllHDR() ? NO : wantsExtendedDynamicRangeContent);
+}
+
+- (BOOL)wantsExtendedDynamicRangeContent {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)setPreferredDynamicRange:(id)preferredDynamicRange {
+    id standardDynamicRange = DYYYStandardCADynamicRange();
+    %orig(DYYYShouldDisableAllHDR() && standardDynamicRange ? standardDynamicRange : preferredDynamicRange);
+}
+
+- (id)preferredDynamicRange {
+    id preferredDynamicRange = %orig;
+    if (DYYYShouldDisableAllHDR()) {
+        id standardDynamicRange = DYYYStandardCADynamicRange();
+        if (standardDynamicRange) {
+            return standardDynamicRange;
+        }
+    }
+    return preferredDynamicRange;
 }
 
 %end
@@ -594,24 +2633,24 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
 
     NSError *error = nil;
     NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^(\\d{10,13})([\\s\\S]*)" options:0 error:&error];
-    
+
     NSTextCheckingResult *match = [regex firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
 
     if (match) {
         NSString *rawTs = [text substringWithRange:[match rangeAtIndex:1]];
         NSString *suffix = [text substringWithRange:[match rangeAtIndex:2]];
-        
+
         long long ts = [rawTs longLongValue];
-        
+
         if (ts > 100000000000) {
             ts = ts / 1000;
         }
-        
+
         NSDate *date = [NSDate dateWithTimeIntervalSince1970:ts];
         NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
         [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
         NSString *formattedDate = [formatter stringFromDate:date];
-        
+
         NSString *newText = [NSString stringWithFormat:@"%@%@", formattedDate, suffix];
         %orig(newText);
     } else {
@@ -626,7 +2665,7 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
 
 - (void)setText:(NSString *)text {
     %orig(text); // 先让系统把文本赋上去
-    
+
     if (!DYYYGetBool(@"DYYYCommentExactTime")) {
         return;
     }
@@ -649,11 +2688,11 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
     if (font) {
         CGFloat expectedWidth = ceilf([text sizeWithAttributes:@{NSFontAttributeName: font}].width);
         CGRect currentFrame = label.frame;
-        
+
         // 如果当前宽度不够，并且不是尚未初始化的状态（>0），则强行修改并重新赋值
         if (currentFrame.size.width < expectedWidth && currentFrame.size.width > 0) {
             currentFrame.size.width = expectedWidth;
-            label.frame = currentFrame; 
+            label.frame = currentFrame;
             label.clipsToBounds = NO;
         }
     }
@@ -673,7 +2712,7 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
         if ([text isEqualToString:@"翻译"] || [text isEqualToString:@"隐藏翻译"]) {
             CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
             frame.origin.x = screenWidth - 100.0 - frame.size.width;
-        } 
+        }
         // --- 2. 拦截时间文本，如果不够宽则扩充宽度 ---
         else if ([self respondsToSelector:@selector(font)]) {
             UIFont *font = label.font;
@@ -712,19 +2751,19 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
     if (match) {
         NSString *rawTs = [plainText substringWithRange:[match rangeAtIndex:1]];
         long long ts = [rawTs longLongValue];
-        
+
         if (ts > 100000000000) {
             ts = ts / 1000;
         }
-        
+
         NSDate *date = [NSDate dateWithTimeIntervalSince1970:ts];
         NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
         [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
         NSString *formattedDate = [formatter stringFromDate:date];
-        
+
         NSMutableAttributedString *newAttrStr = [attributedText mutableCopy];
         [newAttrStr replaceCharactersInRange:[match rangeAtIndex:1] withString:formattedDate];
-        
+
         %orig(newAttrStr);
     } else {
         %orig(attributedText);
@@ -1310,6 +3349,7 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
 %hook AWEPlayInteractionProgressContainerView
 - (void)layoutSubviews {
     %orig;
+    DYYYApplyFloatClearProgressStateToView(self);
 
     if (![[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYEnableFullScreen"]) {
         return;
@@ -1336,6 +3376,11 @@ static BOOL DYYYShouldHandleSpeedFeatures(void) {
 %end
 
 %hook AWEFeedProgressSlider
+
+- (void)layoutSubviews {
+    %orig;
+    DYYYApplyFloatClearProgressStateToView(self);
+}
 
 - (void)setAlpha:(CGFloat)alpha {
     if (DYYYGetBool(@"DYYYShowScheduleDisplay")) {
@@ -2160,17 +4205,25 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
 %hook _TtC33AWECommentLongPressPanelSwiftImpl32CommentLongPressPanelCopyElement
 
 - (void)elementTapped {
-    if (DYYYGetBool(@"DYYYCommentCopyText")) {
-        AWECommentLongPressPanelContext *commentPageContext = [self commentPageContext];
-        AWECommentModel *selectdComment = [commentPageContext selectdComment];
-        if (!selectdComment) {
-            AWECommentLongPressPanelParam *params = [commentPageContext params];
-            selectdComment = [params selectdComment];
-        }
-        NSString *descText = [selectdComment content];
-        [[UIPasteboard generalPasteboard] setString:descText];
-        [DYYYToast showSuccessToastWithMessage:@"评论已复制"];
+    if (!DYYYGetBool(@"DYYYCommentCopyText")) {
+        %orig;
+        return;
     }
+
+    AWECommentLongPressPanelContext *commentPageContext = [self commentPageContext];
+    AWECommentModel *selectdComment = [commentPageContext selectdComment];
+    if (!selectdComment) {
+        AWECommentLongPressPanelParam *params = [commentPageContext params];
+        selectdComment = [params selectdComment];
+    }
+    NSString *descText = [selectdComment content];
+    if (descText.length == 0) {
+        %orig;
+        return;
+    }
+
+    [[UIPasteboard generalPasteboard] setString:descText];
+    [DYYYToast showSuccessToastWithMessage:@"评论已复制"];
 }
 %end
 
@@ -2524,7 +4577,6 @@ static NSArray<NSString *> *dyyy_qualityRank = nil;
 
 %hook AWEPlayInteractionSpeedController
 
-static BOOL hasChangedSpeed = NO;
 static CGFloat currentLongPressSpeed = 0;
 static CGFloat initialTouchX = 0;
 static BOOL isGestureActive = NO;
@@ -2545,38 +4597,48 @@ static BOOL isGestureActive = NO;
         return;
     }
 
-    if (speed == 2.0) {
-        if (!hasChangedSpeed) {
-            if (longPressSpeed != 0 && longPressSpeed != 2.0) {
-                hasChangedSpeed = YES;
-                %orig(longPressSpeed);
-                return;
-            }
-        } else {
-            hasChangedSpeed = NO;
-            %orig(1.0);
-            return;
-        }
-    }
-
-    if (longPressSpeed == 0 || longPressSpeed == 2) {
-        %orig(speed);
+    if (speed == 2.0 && longPressSpeed != 0 && longPressSpeed != 2.0) {
+        %orig(longPressSpeed);
         return;
     }
+
+    if (speed <= 1.0 && dyyyLongPressLockedSpeedActive) {
+        DYYYEndLockedLongPressSpeedAndRestoreIfNeeded();
+    }
+
+    %orig(speed);
 }
 
 - (void)handleLongPressFastSpeed:(UILongPressGestureRecognizer *)gesture {
+    BOOL enableSpeedGesture = DYYYGetBool(@"DYYYEnableLongPressSpeedGesture");
+    CGPoint location = [gesture locationInView:gesture.view];
+    static CGFloat initialTouchY = 0;
+    BOOL isBeginning = gesture.state == UIGestureRecognizerStateBegan;
+    BOOL isEnding = gesture.state == UIGestureRecognizerStateEnded ||
+                    gesture.state == UIGestureRecognizerStateCancelled ||
+                    gesture.state == UIGestureRecognizerStateFailed;
+
+    if (isBeginning) {
+        dyyyLongPressFastSpeedActive = YES;
+        dyyyLongPressLockedSpeedActive = NO;
+    } else if (isEnding) {
+        isGestureActive = NO;
+        currentLongPressSpeed = 0;
+        initialTouchY = 0;
+        dyyyLongPressFastSpeedActive = NO;
+    }
+
     %orig;
 
-    if (!DYYYGetBool(@"DYYYEnableLongPressSpeedGesture")) {
+    if (isEnding) {
+        DYYYScheduleConfiguredPlaybackSpeedRestore();
+    }
+
+    if (!enableSpeedGesture) {
         return;
     }
 
-    CGPoint location = [gesture locationInView:gesture.view];
-
-    static CGFloat initialTouchY = 0;
-
-    if (gesture.state == UIGestureRecognizerStateBegan) {
+    if (isBeginning) {
         initialTouchY = location.y;
         isGestureActive = YES;
 
@@ -2604,11 +4666,30 @@ static BOOL isGestureActive = NO;
             }
         }
     }
-    else if (gesture.state == UIGestureRecognizerStateEnded ||
-             gesture.state == UIGestureRecognizerStateCancelled) {
-        isGestureActive = NO;
-        currentLongPressSpeed = 0;
-        initialTouchY = 0;
+}
+
+- (void)handleLongPressLockedSpeedBegan {
+    dyyyLongPressFastSpeedActive = YES;
+    dyyyLongPressLockedSpeedActive = NO;
+    %orig;
+}
+
+- (void)handleLongPressLockedDoubleSpeedChanged:(id)arg1 gesture:(UIGestureRecognizer *)gesture {
+    dyyyLongPressFastSpeedActive = YES;
+    dyyyLongPressLockedSpeedActive = NO;
+    %orig(arg1, gesture);
+}
+
+- (void)handleLongPressLockedDoubleSpeedEnded:(id)arg1 gesture:(UIGestureRecognizer *)gesture {
+    %orig(arg1, gesture);
+    dyyyLongPressFastSpeedActive = NO;
+    dyyyLongPressLockedSpeedActive = YES;
+}
+
+- (void)longPressSpeedControlDidChangeSpeed:(double)speed {
+    %orig(speed);
+    if (speed <= 1.0 && dyyyLongPressLockedSpeedActive) {
+        DYYYEndLockedLongPressSpeedAndRestoreIfNeeded();
     }
 }
 %end
@@ -2724,7 +4805,7 @@ static BOOL dyyyShouldUseLastStickerURL = NO;
     AWECommentLongPressPanelContext *context = [self commentPageContext];
     AWECommentLongPressPanelParam *params = [context params];
     AWECommentModel *comment = [context selectdComment] ?: [params selectdComment];
-    
+
     // 判断保存类型(表情包/音频/图片)
     AWEIMStickerModel *sticker = [comment sticker];
     NSArray *stickerURLList = sticker.staticURLModel.originURLList;
@@ -2732,19 +4813,19 @@ static BOOL dyyyShouldUseLastStickerURL = NO;
 
     AWECommentAudioModel *audio = [comment audioModel];
     BOOL hasAudio = (audio && audio.content);
-    
+
     NSArray *imageList = nil;
     if ([comment respondsToSelector:@selector(imageList)]) {
         imageList = [comment imageList];
     }
     BOOL hasImages = (imageList && imageList.count > 0);
-    
+
     // 表情包保存逻辑
     if (hasSticker && DYYYGetBool(@"DYYYForceDownloadEmotion")) {
         NSString *urlString = dyyyShouldUseLastStickerURL ? stickerURLList.lastObject : stickerURLList.firstObject;
         dyyyShouldUseLastStickerURL = NO;
         NSURL *stickerURL = [NSURL URLWithString:urlString];
-        
+
         if (stickerURL) {
             [DYYYManager downloadMedia:stickerURL
                              mediaType:MediaTypeHeic
@@ -2761,7 +4842,7 @@ static BOOL dyyyShouldUseLastStickerURL = NO;
     // 音频保存逻辑
     if (hasAudio && DYYYGetBool(@"DYYYForceDownloadCommentAudio")) {
         NSString *audioContent = audio.content;
-        
+
         NSString *userName = @"未知用户";
         if (comment.author && [comment.author respondsToSelector:@selector(nickname)]) {
             NSString *nickname = [comment.author performSelector:@selector(nickname)];
@@ -2769,7 +4850,7 @@ static BOOL dyyyShouldUseLastStickerURL = NO;
                 userName = nickname;
             }
         }
-        
+
         [DYYYManager downloadAndShareCommentAudio:audioContent
                                          userName:userName
                                        createTime:comment.createTime];
@@ -2789,17 +4870,17 @@ static BOOL dyyyShouldUseLastStickerURL = NO;
                 isPicInflow = [isPicInflowValue integerValue] == 1;
             }
         }
-        
+
         NSInteger currentIndex = -1; // -1 表示保存全部
-        
+
         if (isPicInflow) {
             // 使用 DYYYUtils 封装的方法查找目标控制器
             UIViewController *topVC = [DYYYUtils topView];
-            
+
             // 获取 Ivar 定义的类和目标控制器类
             Class ivarClass = NSClassFromString(@"AWECommentMediaFeedSwfitImpl.CommentMediaFeedCellViewController");
             Class targetClass = NSClassFromString(@"AWECommentMediaFeedSwfitImpl.CommentMediaFeedCommonImageCellViewController");
-            
+
             if (ivarClass && targetClass && topVC) {
                 Ivar multiIndexIvar = class_getInstanceVariable(ivarClass, "currentIndexInMultiImageList");
                 if (multiIndexIvar) {
@@ -2812,11 +4893,11 @@ static BOOL dyyyShouldUseLastStickerURL = NO;
                 }
             }
         }
-        
-        NSString *hint = (currentIndex >= 0) ? @"正在保存当前图片..." : 
+
+        NSString *hint = (currentIndex >= 0) ? @"正在保存当前图片..." :
             [NSString stringWithFormat:@"正在保存 %lu 张图片...", (unsigned long)imageList.count];
         [DYYYUtils showToast:hint];
-        
+
         [DYYYManager saveCommentImages:imageList
                             currentIndex:currentIndex
                             completion:^(NSInteger successCount, NSInteger livePhotoCount, NSInteger failedCount) {
@@ -2831,7 +4912,7 @@ static BOOL dyyyShouldUseLastStickerURL = NO;
         }];
         return;
     }
-    
+
     // 默认行为
     %orig;
 }
@@ -3109,7 +5190,7 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 
 %hook AWEFeedLiveMarkView
 - (void)setHidden:(BOOL)hidden {
-    if (DYYYGetBool(@"DYYYHideAvatarButton")) {
+    if (DYYYGetBool(@"DYYYHideAvatarLive")) {
         hidden = YES;
     }
 
@@ -3117,15 +5198,396 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 }
 %end
 
+static id DYYYAvatarObjectForSelector(id object, SEL selector) {
+    if (!object || !selector || ![object respondsToSelector:selector]) {
+        return nil;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    return [object performSelector:selector];
+#pragma clang diagnostic pop
+}
+
+static UIView *DYYYAvatarViewForSelector(id object, SEL selector) {
+    id value = DYYYAvatarObjectForSelector(object, selector);
+    return [value isKindOfClass:[UIView class]] ? value : nil;
+}
+
+static char kDYYYAvatarFollowDeferredApplyKey;
+
+static BOOL DYYYAvatarFollowOptionsEnabled(void) {
+    return DYYYGetBool(@"DYYYHideLOTAnimationView") || DYYYGetBool(@"DYYYHideFollowPromptView");
+}
+
+static void DYYYHideAvatarVisualForSelector(id object, SEL selector) {
+    UIView *view = DYYYAvatarViewForSelector(object, selector);
+    if (view) {
+        view.hidden = YES;
+    }
+}
+
+static void DYYYRemoveAvatarView(UIView *view) {
+    if (!view) {
+        return;
+    }
+    view.hidden = YES;
+    view.userInteractionEnabled = NO;
+}
+
+static void DYYYRemoveAvatarViewForSelector(id object, SEL selector) {
+    UIView *view = DYYYAvatarViewForSelector(object, selector);
+    DYYYRemoveAvatarView(view);
+}
+
+static void DYYYHideAvatarFollowLayerContents(UIView *view) {
+    view.backgroundColor = UIColor.clearColor;
+    view.opaque = NO;
+    view.layer.contents = nil;
+    view.layer.opaque = NO;
+    view.layer.backgroundColor = UIColor.clearColor.CGColor;
+    view.layer.borderWidth = 0.0;
+    view.layer.borderColor = UIColor.clearColor.CGColor;
+    view.layer.shadowOpacity = 0.0;
+    view.layer.shadowColor = UIColor.clearColor.CGColor;
+    for (CALayer *sublayer in view.layer.sublayers) {
+        sublayer.hidden = YES;
+    }
+}
+
+static void DYYYClearAvatarActionLayerChrome(CALayer *layer) {
+    if (!layer) {
+        return;
+    }
+
+    layer.contents = nil;
+    layer.opaque = NO;
+    layer.backgroundColor = UIColor.clearColor.CGColor;
+    layer.borderWidth = 0.0;
+    layer.borderColor = UIColor.clearColor.CGColor;
+    layer.shadowOpacity = 0.0;
+    layer.shadowColor = UIColor.clearColor.CGColor;
+    if ([layer isKindOfClass:[CAShapeLayer class]]) {
+        CAShapeLayer *shapeLayer = (CAShapeLayer *)layer;
+        shapeLayer.fillColor = UIColor.clearColor.CGColor;
+        shapeLayer.strokeColor = UIColor.clearColor.CGColor;
+    }
+
+    for (CALayer *sublayer in [layer.sublayers copy]) {
+        DYYYClearAvatarActionLayerChrome(sublayer);
+    }
+}
+
+static void DYYYClearAvatarActionSubviewChrome(UIView *view) {
+    if (!view) {
+        return;
+    }
+
+    view.backgroundColor = UIColor.clearColor;
+    view.opaque = NO;
+    DYYYClearAvatarActionLayerChrome(view.layer);
+
+    for (UIView *subview in [view.subviews copy]) {
+        DYYYClearAvatarActionSubviewChrome(subview);
+    }
+}
+
+static void DYYYClearAvatarActionViewChrome(UIView *view) {
+    if (!view) {
+        return;
+    }
+
+    view.backgroundColor = UIColor.clearColor;
+    view.opaque = NO;
+    DYYYClearAvatarActionLayerChrome(view.layer);
+
+    for (UIView *subview in [view.subviews copy]) {
+        DYYYClearAvatarActionSubviewChrome(subview);
+    }
+}
+
+static BOOL DYYYIsLegacyAvatarFollowAnimationView(UIView *view) {
+    Class promptClass = NSClassFromString(@"AWEPlayInteractionFollowPromptView");
+    UIView *ancestor = view.superview;
+    for (NSInteger depth = 0; ancestor && depth < 6; depth++, ancestor = ancestor.superview) {
+        if (promptClass && [ancestor isKindOfClass:promptClass]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL DYYYHideAvatarFollowIconInView(UIView *view) {
+    if (!view) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass(view.class);
+    if ([className isEqualToString:@"LOTAnimationView"]) {
+        DYYYHideAvatarFollowLayerContents(view);
+        return YES;
+    }
+
+    if ([className isEqualToString:@"AWEPlayInteractionStaticFollowAnimationView"]) {
+        BOOL foundIcon = NO;
+        for (NSString *selectorName in @[ @"plusImageView", @"tickImageView" ]) {
+            UIView *iconView = DYYYAvatarViewForSelector(view, NSSelectorFromString(selectorName));
+            if (iconView) {
+                iconView.hidden = YES;
+                foundIcon = YES;
+            }
+        }
+        if (!foundIcon) {
+            DYYYHideAvatarFollowLayerContents(view);
+        }
+        return YES;
+    }
+
+    BOOL foundIcon = NO;
+    for (UIView *subview in view.subviews) {
+        foundIcon = DYYYHideAvatarFollowIconInView(subview) || foundIcon;
+    }
+    return foundIcon;
+}
+
+static BOOL DYYYIsAvatarFollowContainerView(UIView *view) {
+    NSString *className = NSStringFromClass(view.class);
+    return [className containsString:@"Follow"] || [className containsString:@"follow"] ||
+           [className containsString:@"Prompt"] || [className containsString:@"Add"] ||
+           [className containsString:@"SendMessage"] || [className containsString:@"sendMessage"] ||
+           [className containsString:@"SendMsg"] || [className containsString:@"sendMsg"] ||
+           [className containsString:@"EnterStore"] || [className containsString:@"enterStore"] ||
+           [className containsString:@"LinkIcon"] || [className containsString:@"linkIcon"];
+}
+
+static BOOL DYYYIsSmallAvatarFollowBadgeView(UIView *view) {
+    CGFloat width = CGRectGetWidth(view.bounds);
+    CGFloat height = CGRectGetHeight(view.bounds);
+    return width > 0.0 && height > 0.0 && width <= 52.0 && height <= 52.0;
+}
+
+static UIView *DYYYAvatarFollowRemovalTargetForView(UIView *view, UIView *rootView) {
+    UIView *target = view;
+    UIView *ancestor = view.superview;
+    while (ancestor && ancestor != rootView) {
+        if (DYYYIsAvatarFollowContainerView(ancestor) || DYYYIsSmallAvatarFollowBadgeView(ancestor)) {
+            target = ancestor;
+            ancestor = ancestor.superview;
+            continue;
+        }
+        break;
+    }
+    return target;
+}
+
+static BOOL DYYYHideAvatarAuxiliaryActionVisualsInView(UIView *view) {
+    if (!view) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass(view.class);
+    BOOL isActionVisual = [view isKindOfClass:[UIImageView class]] ||
+                          [className containsString:@"GuideAnimation"] ||
+                          [className containsString:@"SendMessageImage"] ||
+                          [className containsString:@"SendMsgImage"] ||
+                          [className containsString:@"EnterStoreImage"] ||
+                          [className containsString:@"LinkIcon"];
+    if (isActionVisual) {
+        view.hidden = YES;
+        return YES;
+    }
+
+    BOOL foundVisual = NO;
+    for (UIView *subview in [view.subviews copy]) {
+        foundVisual = DYYYHideAvatarAuxiliaryActionVisualsInView(subview) || foundVisual;
+    }
+    return foundVisual;
+}
+
+static NSArray<NSArray<NSString *> *> *DYYYAvatarAuxiliaryActionSelectorGroups(void) {
+    return @[
+        @[ @"sendMessageView", @"avatarSendMessageImageView", @"sendMessageGuideView" ],
+        @[ @"enterStoreView", @"avatarEnterStoreImageView", @"enterStoreGuideView" ],
+        @[ @"linkIconContainerView", @"userAvatarLinkIcon" ],
+    ];
+}
+
+static BOOL DYYYApplyAvatarAuxiliaryActionSettingsForOwner(id owner) {
+    BOOL hidePlus = DYYYGetBool(@"DYYYHideLOTAnimationView");
+    BOOL removePlus = DYYYGetBool(@"DYYYHideFollowPromptView");
+    if (!hidePlus && !removePlus) {
+        return NO;
+    }
+
+    BOOL handled = NO;
+    for (NSArray<NSString *> *selectorGroup in DYYYAvatarAuxiliaryActionSelectorGroups()) {
+        UIView *containerView = DYYYAvatarViewForSelector(owner, NSSelectorFromString(selectorGroup.firstObject));
+        NSMutableArray<UIView *> *visualViews = [NSMutableArray array];
+        for (NSUInteger index = 1; index < selectorGroup.count; index++) {
+            UIView *visualView = DYYYAvatarViewForSelector(owner, NSSelectorFromString(selectorGroup[index]));
+            if (visualView) {
+                [visualViews addObject:visualView];
+            }
+        }
+
+        if (removePlus) {
+            UIView *fallbackVisual = visualViews.firstObject;
+            UIView *removalTarget = containerView ?: DYYYAvatarFollowRemovalTargetForView(fallbackVisual, nil);
+            DYYYRemoveAvatarView(removalTarget);
+            for (UIView *visualView in visualViews) {
+                DYYYRemoveAvatarView(visualView);
+            }
+            handled = (removalTarget || visualViews.count > 0) || handled;
+            continue;
+        }
+
+        for (UIView *visualView in visualViews) {
+            visualView.hidden = YES;
+            handled = YES;
+        }
+        if (containerView) {
+            DYYYClearAvatarActionViewChrome(containerView);
+            BOOL foundVisual = DYYYHideAvatarAuxiliaryActionVisualsInView(containerView);
+            if (!foundVisual && visualViews.count == 0) {
+                DYYYHideAvatarFollowLayerContents(containerView);
+            }
+            handled = YES;
+        }
+    }
+    return handled;
+}
+
+static BOOL DYYYApplyAvatarFollowSettingsInView(UIView *view, UIView *rootView) {
+    if (!view) {
+        return NO;
+    }
+
+    BOOL hidePlus = DYYYGetBool(@"DYYYHideLOTAnimationView");
+    BOOL removePlus = DYYYGetBool(@"DYYYHideFollowPromptView");
+    if (!hidePlus && !removePlus) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass(view.class);
+    BOOL isAvatarView = [className isEqualToString:@"AWEPlayInteractionUserAvatarView"];
+    BOOL isStaticFollowView = [className isEqualToString:@"AWEPlayInteractionStaticFollowAnimationView"];
+    BOOL isLegacyFollowAnimation = [className isEqualToString:@"LOTAnimationView"] && DYYYIsLegacyAvatarFollowAnimationView(view);
+    BOOL isLegacyPromptContainer = [className isEqualToString:@"AWEPlayInteractionFollowPromptView"];
+    BOOL handled = NO;
+
+    if (isAvatarView) {
+        handled = DYYYApplyAvatarAuxiliaryActionSettingsForOwner(view) || handled;
+    }
+
+    if (isStaticFollowView || isLegacyFollowAnimation) {
+        if (removePlus) {
+            DYYYRemoveAvatarView(DYYYAvatarFollowRemovalTargetForView(view, rootView));
+        } else {
+            DYYYHideAvatarFollowIconInView(view);
+        }
+        handled = YES;
+    } else if (removePlus && isLegacyPromptContainer) {
+        view.hidden = YES;
+        view.userInteractionEnabled = NO;
+        handled = YES;
+    }
+
+    for (UIView *subview in [view.subviews copy]) {
+        handled = DYYYApplyAvatarFollowSettingsInView(subview, rootView) || handled;
+    }
+    return handled;
+}
+
+static void DYYYApplyAvatarFollowSettingsForContext(id context) {
+    UIView *elementView = DYYYAvatarViewForSelector(context, NSSelectorFromString(@"elementView"));
+    if (elementView) {
+        DYYYApplyAvatarFollowSettingsInView(elementView, elementView);
+    }
+}
+
+static void DYYYApplyAvatarFollowPromptSettings(id owner) {
+    BOOL hidePlus = DYYYGetBool(@"DYYYHideLOTAnimationView");
+    BOOL removePlus = DYYYGetBool(@"DYYYHideFollowPromptView");
+    if (!hidePlus && !removePlus) {
+        return;
+    }
+
+    for (NSString *selectorName in @[ @"followAnimationView", @"unfollowAnimationView", @"staticFollowAnimationView" ]) {
+        UIView *animationView = DYYYAvatarViewForSelector(owner, NSSelectorFromString(selectorName));
+        if (!animationView) {
+            continue;
+        }
+        if (removePlus) {
+            DYYYRemoveAvatarView(DYYYAvatarFollowRemovalTargetForView(animationView, nil));
+        } else {
+            DYYYHideAvatarFollowIconInView(animationView);
+        }
+    }
+
+    UIView *followAddView = DYYYAvatarViewForSelector(owner, NSSelectorFromString(@"followAddView"));
+    if (removePlus) {
+        DYYYRemoveAvatarView(followAddView);
+    } else {
+        BOOL foundIcon = DYYYHideAvatarFollowIconInView(followAddView);
+        if (hidePlus && followAddView) {
+            DYYYClearAvatarActionViewChrome(followAddView);
+            if (!foundIcon) {
+                DYYYHideAvatarFollowLayerContents(followAddView);
+            }
+        }
+    }
+
+    UIView *followPromptView = DYYYAvatarViewForSelector(owner, NSSelectorFromString(@"followPromptView"));
+    if (removePlus) {
+        DYYYRemoveAvatarView(followPromptView);
+    } else {
+        DYYYApplyAvatarFollowSettingsInView(followPromptView, followPromptView);
+    }
+
+    DYYYApplyAvatarAuxiliaryActionSettingsForOwner(owner);
+
+    if ([owner isKindOfClass:[UIView class]]) {
+        DYYYApplyAvatarFollowSettingsInView((UIView *)owner, (UIView *)owner);
+    } else if ([owner isKindOfClass:[UIViewController class]]) {
+        DYYYApplyAvatarFollowSettingsInView(((UIViewController *)owner).view, ((UIViewController *)owner).view);
+    }
+    UIView *userAvatarView = DYYYAvatarViewForSelector(owner, NSSelectorFromString(@"userAvatarView"));
+    if (userAvatarView) {
+        DYYYApplyAvatarFollowSettingsInView(userAvatarView, userAvatarView);
+    }
+    DYYYApplyAvatarFollowSettingsForContext(DYYYAvatarObjectForSelector(owner, NSSelectorFromString(@"userAvatarContext")));
+}
+
+static void DYYYApplyAvatarFollowPromptSettingsWithRetry(id owner) {
+    DYYYApplyAvatarFollowPromptSettings(owner);
+    if (!owner || !DYYYAvatarFollowOptionsEnabled() || objc_getAssociatedObject(owner, &kDYYYAvatarFollowDeferredApplyKey)) {
+        return;
+    }
+
+    objc_setAssociatedObject(owner, &kDYYYAvatarFollowDeferredApplyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    id target = owner;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DYYYApplyAvatarFollowPromptSettings(target);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            DYYYApplyAvatarFollowPromptSettings(target);
+            objc_setAssociatedObject(target, &kDYYYAvatarFollowDeferredApplyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        });
+    });
+}
+
 // 隐藏头像加号和透明
 %hook LOTAnimationView
 - (void)layoutSubviews {
     %orig;
-    // 确保只有头像的LOTAnimationView才则执行该逻辑, 防止误杀
-    if ([self.superview isKindOfClass:%c(AWEPlayInteractionFollowPromptView)]) {
+    // 旧版加号动画可能被额外容器包裹，沿父视图向上识别关注提示视图。
+    if (DYYYIsLegacyAvatarFollowAnimationView(self)) {
         // 检查是否需要隐藏加号
-        if (DYYYGetBool(@"DYYYHideLOTAnimationView") || DYYYGetBool(@"DYYYHideFollowPromptView")) {
-            [self removeFromSuperview];
+        if (DYYYAvatarFollowOptionsEnabled()) {
+            if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+                DYYYRemoveAvatarView(DYYYAvatarFollowRemovalTargetForView(self, nil));
+            } else {
+                DYYYHideAvatarFollowLayerContents(self);
+            }
+            DYYYApplyAvatarFollowPromptSettingsWithRetry(self.superview ?: self);
             return;
         }
         // 应用透明度设置
@@ -3134,6 +5596,16 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
             CGFloat alphaValue = [transparencyValue floatValue];
             self.alpha = alphaValue;
         }
+    }
+}
+%end
+
+%hook AWEPlayInteractionStaticFollowAnimationView
+- (void)layoutSubviews {
+    %orig;
+    if (DYYYAvatarFollowOptionsEnabled()) {
+        DYYYApplyAvatarFollowSettingsInView((UIView *)self, nil);
+        DYYYApplyAvatarFollowPromptSettingsWithRetry(self.superview ?: self);
     }
 }
 %end
@@ -3654,14 +6126,28 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 - (void)layoutSubviews {
     %orig;
 
-    NSString *accessibilityLabel = self.accessibilityLabel;
-
-    if ([accessibilityLabel isEqualToString:@"关注"]) {
-        if (DYYYGetBool(@"DYYYHideAvatarButton") || DYYYGetBool(@"DYYYHideFollowPromptView")) {
-            self.userInteractionEnabled = NO;
-            self.hidden = YES;
+    if (DYYYAvatarFollowOptionsEnabled()) {
+        DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+        if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
             return;
         }
+    }
+}
+
+- (void)didMoveToWindow {
+    %orig;
+
+    if (DYYYAvatarFollowOptionsEnabled()) {
+        DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+    }
+}
+
+- (void)didMoveToSuperview {
+    %orig;
+
+    if (DYYYAvatarFollowOptionsEnabled()) {
+        DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+        return;
     }
 }
 
@@ -3727,12 +6213,14 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 - (BOOL)prefersStatusBarHidden {
     if (DYYYGetBool(@"DYYYHideStatusbar")) {
         return YES;
-    } else {
-        if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) != class_getInstanceMethod([%c(AWEFeedRootViewController) class], @selector(prefersStatusBarHidden))) {
-            return %orig;
-        }
-        return NO;
     }
+    if (DYYYGetBool(@"DYYYHideStatusBarOnClear") && hideButton && hideButton.isElementsHidden) {
+        return YES;
+    }
+    if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) != class_getInstanceMethod([%c(AWEFeedRootViewController) class], @selector(prefersStatusBarHidden))) {
+        return %orig;
+    }
+    return NO;
 }
 %end
 
@@ -3741,13 +6229,15 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 - (BOOL)prefersStatusBarHidden {
     if (DYYYGetBool(@"DYYYHideStatusbar")) {
         return YES;
-    } else {
-        if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
-            class_getInstanceMethod([%c(IESLiveAudienceViewController) class], @selector(prefersStatusBarHidden))) {
-            return %orig;
-        }
-        return NO;
     }
+    if (DYYYGetBool(@"DYYYHideStatusBarOnClear") && hideButton && hideButton.isElementsHidden) {
+        return YES;
+    }
+    if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
+        class_getInstanceMethod([%c(IESLiveAudienceViewController) class], @selector(prefersStatusBarHidden))) {
+        return %orig;
+    }
+    return NO;
 }
 %end
 
@@ -3756,13 +6246,15 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 - (BOOL)prefersStatusBarHidden {
     if (DYYYGetBool(@"DYYYHideStatusbar")) {
         return YES;
-    } else {
-        if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
-            class_getInstanceMethod([%c(AWEAwemeDetailTableViewController) class], @selector(prefersStatusBarHidden))) {
-            return %orig;
-        }
-        return NO;
     }
+    if (DYYYGetBool(@"DYYYHideStatusBarOnClear") && hideButton && hideButton.isElementsHidden) {
+        return YES;
+    }
+    if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
+        class_getInstanceMethod([%c(AWEAwemeDetailTableViewController) class], @selector(prefersStatusBarHidden))) {
+        return %orig;
+    }
+    return NO;
 }
 %end
 
@@ -3771,13 +6263,15 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 - (BOOL)prefersStatusBarHidden {
     if (DYYYGetBool(@"DYYYHideStatusbar")) {
         return YES;
-    } else {
-        if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
-            class_getInstanceMethod([%c(AWEAwemeHotSpotTableViewController) class], @selector(prefersStatusBarHidden))) {
-            return %orig;
-        }
-        return NO;
     }
+    if (DYYYGetBool(@"DYYYHideStatusBarOnClear") && hideButton && hideButton.isElementsHidden) {
+        return YES;
+    }
+    if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
+        class_getInstanceMethod([%c(AWEAwemeHotSpotTableViewController) class], @selector(prefersStatusBarHidden))) {
+        return %orig;
+    }
+    return NO;
 }
 %end
 
@@ -3786,13 +6280,15 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 - (BOOL)prefersStatusBarHidden {
     if (DYYYGetBool(@"DYYYHideStatusbar")) {
         return YES;
-    } else {
-        if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
-            class_getInstanceMethod([%c(AWEFullPageFeedNewContainerViewController) class], @selector(prefersStatusBarHidden))) {
-            return %orig;
-        }
-        return NO;
     }
+    if (DYYYGetBool(@"DYYYHideStatusBarOnClear") && hideButton && hideButton.isElementsHidden) {
+        return YES;
+    }
+    if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
+        class_getInstanceMethod([%c(AWEFullPageFeedNewContainerViewController) class], @selector(prefersStatusBarHidden))) {
+        return %orig;
+    }
+    return NO;
 }
 %end
 
@@ -3801,13 +6297,15 @@ static NSArray *DYYYIMMenuItemsByAddingDownloadAction(NSArray *menuItems, id cel
 - (BOOL)prefersStatusBarHidden {
     if (DYYYGetBool(@"DYYYHideStatusbar")) {
         return YES;
-    } else {
-        if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
-            class_getInstanceMethod([%c(AFDPureModePageContainerViewController) class], @selector(prefersStatusBarHidden))) {
-            return %orig;
-        }
-        return NO;
     }
+    if (DYYYGetBool(@"DYYYHideStatusBarOnClear") && hideButton && hideButton.isElementsHidden) {
+        return YES;
+    }
+    if (class_getInstanceMethod([self class], @selector(prefersStatusBarHidden)) !=
+        class_getInstanceMethod([%c(AFDPureModePageContainerViewController) class], @selector(prefersStatusBarHidden))) {
+        return %orig;
+    }
+    return NO;
 }
 %end
 
@@ -4864,6 +7362,7 @@ static NSHashTable *processedParentViews = nil;
     NSInteger minLikesThreshold = DYYYGetInteger(@"DYYYFilterLowLikes"); // 读取低赞过滤阈值 (例如: 1000)
     BOOL skipPhotoText = DYYYGetBool(@"DYYYSkipPhotoText"); // 图文过滤
     BOOL skipPhoto = DYYYGetBool(@"DYYYSkipPhoto"); // 图集过滤
+    BOOL shouldDisableHDR = DYYYShouldDisableAllHDR();
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     NSTimeInterval thresholdInSeconds = MAX(daysThreshold, 0) * 86400.0;
@@ -4918,6 +7417,17 @@ static NSHashTable *processedParentViews = nil;
             if (vTs > 0 && (now - vTs) > thresholdInSeconds) {
                 continue; // 超过设定时限，跳过
             }
+        }
+
+        // 4. 全局屏蔽 HDR 时，若作品没有 SDR 码率档，直接过滤，避免强播纯 HDR 源导致黑屏或 HDR 漏出。
+        if (shouldDisableHDR &&
+            ![m dyyy_shouldExcludeFromGlobalHDRFilter] &&
+            DYYYAwemeModelHasOnlyHDRBitrateModels(m)) {
+            continue;
+        }
+
+        if (shouldDisableHDR) {
+            DYYYStripHDRHintsFromAwemeModel(m);
         }
 
         [baseFiltered addObject:obj];
@@ -4982,9 +7492,123 @@ static NSHashTable *processedParentViews = nil;
 
 - (id)initWithDictionary:(id)arg1 error:(id *)arg2 {
     id orig = %orig;
-    if (orig && [self contentFilter])
-        return nil;
+    if (orig) {
+        BOOL shouldDisableHDR = DYYYShouldDisableAllHDR();
+        BOOL shouldFilterOnlyHDRSource = NO;
+        if (shouldDisableHDR && ![self dyyy_shouldExcludeFromGlobalHDRFilter]) {
+            shouldFilterOnlyHDRSource = DYYYAwemeModelHasOnlyHDRBitrateModels(self);
+            if (!shouldFilterOnlyHDRSource) {
+                shouldFilterOnlyHDRSource = DYYYRawObjectHasOnlyHDRBitrateModels(arg1);
+                if (shouldFilterOnlyHDRSource) {
+                    objc_setAssociatedObject(self, &kDYYYHDROnlyAwemeModelKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+            }
+        }
+        BOOL shouldFilter = [self contentFilter];
+        if (!shouldFilter && shouldFilterOnlyHDRSource) {
+            shouldFilter = YES;
+        }
+        if (!shouldFilter && DYYYShouldFilterGlobalHDR() &&
+            ![self dyyy_shouldExcludeFromGlobalHDRFilter] &&
+            [self dyyy_containsHDRMetadataInObject:arg1 depth:0]) {
+            shouldFilter = YES;
+        }
+        if (shouldFilter) {
+            return nil;
+        }
+        if (shouldDisableHDR) {
+            DYYYStripHDRHintsFromAwemeModel(self);
+        }
+    }
     return orig;
+}
+
+- (void)setVideo:(AWEVideoModel *)video {
+    DYYYStripHDRHintsFromVideoModel(video);
+    %orig;
+}
+
+- (AWEVideoModel *)video {
+    return %orig;
+}
+
+- (void)setAlbumImages:(NSArray<AWEImageAlbumImageModel *> *)albumImages {
+    if (DYYYShouldDisableAllHDR()) {
+        for (AWEImageAlbumImageModel *imageModel in albumImages) {
+            DYYYStripHDRHintsFromVideoModel(DYYYValuePreferringIvar(imageModel, "_clipVideo", @"clipVideo"));
+        }
+    }
+    %orig;
+}
+
+- (NSArray<AWEImageAlbumImageModel *> *)albumImages {
+    return %orig;
+}
+
+- (BOOL)awe_enableHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (id)awe_HDRValueFor:(long long)value enableHDR:(BOOL)enableHDR {
+    return %orig(value, DYYYShouldDisableAllHDR() ? NO : enableHDR);
+}
+
+%new
+- (BOOL)dyyy_shouldExcludeFromGlobalHDRFilter {
+    NSString *referString = [self.referString lowercaseString];
+    if (referString.length == 0) {
+        return NO;
+    }
+
+    return [referString isEqualToString:@"chat"] ||
+           [referString containsString:@"chat_room"] ||
+           [referString containsString:@"message"] ||
+           [referString containsString:@"forward"] ||
+           [referString containsString:@"private"] ||
+           [referString containsString:@"share"] ||
+           [referString hasPrefix:@"im_"] ||
+           [referString containsString:@"_im_"];
+}
+
+%new
+- (BOOL)dyyy_containsHDRMetadataInObject:(id)object depth:(NSUInteger)depth {
+    if (!object || depth > 8) {
+        return NO;
+    }
+
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dictionary = (NSDictionary *)object;
+        for (id rawKey in dictionary) {
+            id value = dictionary[rawKey];
+            NSString *key = [[rawKey description] lowercaseString];
+            NSInteger numericValue = [value respondsToSelector:@selector(integerValue)] ? [value integerValue] : 0;
+
+            if (([key isEqualToString:@"is_source_hdr"] || [key isEqualToString:@"has_filter_hdr"]) && numericValue > 0) {
+                return YES;
+            }
+            if ([key isEqualToString:@"hdr_type"] && numericValue > 0) {
+                return YES;
+            }
+            if ([key isEqualToString:@"hdr_bit"] && numericValue >= 10) {
+                return YES;
+            }
+            if (([value isKindOfClass:[NSDictionary class]] || [value isKindOfClass:[NSArray class]]) &&
+                [self dyyy_containsHDRMetadataInObject:value depth:depth + 1]) {
+                return YES;
+            }
+        }
+    } else if ([object isKindOfClass:[NSArray class]]) {
+        for (id value in (NSArray *)object) {
+            if ([self dyyy_containsHDRMetadataInObject:value depth:depth + 1]) {
+                return YES;
+            }
+        }
+    }
+
+    return NO;
 }
 
 %new
@@ -4996,7 +7620,7 @@ static NSHashTable *processedParentViews = nil;
     BOOL skipPhotoText = DYYYGetBool(@"DYYYSkipPhotoText");
     BOOL skipMusic = DYYYGetBool(@"DYYYSkipMusic");
     BOOL skipAIInteraction = DYYYGetBool(@"DYYYSkipAIInteraction");
-    BOOL filterHDR = DYYYGetBool(@"DYYYFilterFeedHDR");
+    BOOL filterHDR = DYYYShouldFilterGlobalHDR();
 
     BOOL shouldFilterAds = noAds && (self.isAds);
     BOOL shouldFilterHotSpot = skipHotSpot && self.hotSpotLynxCardModel;
@@ -5031,6 +7655,7 @@ static NSHashTable *processedParentViews = nil;
 
     // 获取需要过滤的用户列表
     NSString *filterUsers = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYFilterUsers"];
+    BOOL disableHDR = DYYYShouldDisableAllHDR();
 
     // 检查是否需要过滤特定用户
     if (isRecommendFeed && filterUsers.length > 0 && self.author) {
@@ -5086,20 +7711,40 @@ static NSHashTable *processedParentViews = nil;
         }
     }
 
+    // 全局屏蔽 HDR 时，仍允许有 SDR 档的作品降档播放；纯 HDR 档作品直接过滤，避免黑屏或 HDR 漏出。
+    if (disableHDR &&
+        ![self dyyy_shouldExcludeFromGlobalHDRFilter] &&
+        DYYYAwemeModelHasOnlyHDRBitrateModels(self)) {
+        shouldFilterHDR = YES;
+    }
 
-    // 检查是否为HDR视频
-    if (filterHDR && self.video && self.video.bitrateModels) {
-        for (id bitrateModel in self.video.bitrateModels) {
-            NSNumber *hdrType = [bitrateModel valueForKey:@"hdrType"];
-            NSNumber *hdrBit = [bitrateModel valueForKey:@"hdrBit"];
+    // 全场景过滤 HDR 作品，但保留私信、消息详情和转发链路。
+    if (filterHDR && ![self dyyy_shouldExcludeFromGlobalHDRFilter] && self.video) {
+        AWEVideoModel *video = self.video;
+        if ([video respondsToSelector:@selector(isSourceHDR)] && video.isSourceHDR > 0) {
+            shouldFilterHDR = YES;
+        } else if ([video respondsToSelector:@selector(hasFilterHDR)] && video.hasFilterHDR) {
+            shouldFilterHDR = YES;
+        }
 
-            // 如果hdrType=1且hdrBit=10，则视为HDR视频
-            if (hdrType && [hdrType integerValue] == 1 && hdrBit && [hdrBit integerValue] == 10) {
-                shouldFilterHDR = YES;
-                break;
+        if (!shouldFilterHDR) {
+            for (id bitrateModel in video.bitrateModels) {
+                @try {
+                    NSNumber *hdrType = [bitrateModel valueForKey:@"hdrType"];
+                    NSNumber *hdrBit = [bitrateModel valueForKey:@"hdrBit"];
+
+                    // hdrType 覆盖 HDR10、HLG、HDR Vivid 等类型；无类型字段时保留 10bit 兜底。
+                    if ((hdrType && [hdrType integerValue] > 0) ||
+                        (!hdrType && hdrBit && [hdrBit integerValue] >= 10)) {
+                        shouldFilterHDR = YES;
+                        break;
+                    }
+                } @catch (__unused NSException *exception) {
+                }
             }
         }
     }
+
     return shouldFilterAds || shouldFilterAllLive || shouldFilterHotSpot || shouldFilterHDR || shouldFilterKeywords || shouldFilterProp ||
            shouldFilterTime || shouldFilterUser;
 }
@@ -5430,7 +8075,7 @@ static NSHashTable *processedParentViews = nil;
 // 屏蔽通用锚点（合并到锚点信息）
 - (id)commonAnchor {
 	BOOL DYYYHideFeedAnchorContainer = DYYYGetBool(@"DYYYHideFeedAnchorContainer");
-	if (DYYYHideFeedAnchorContainer) { 
+	if (DYYYHideFeedAnchorContainer) {
 		return nil;
 	}
 	return %orig;
@@ -5780,17 +8425,17 @@ static NSHashTable *processedParentViews = nil;
 %hook AWEGeneralSearchModel
 - (instancetype)initWithDictionary:(id)dict error:(NSError **)error {
 	id orig = %orig;
-	
+
 	BOOL noAds = DYYYGetBool(@"DYYYNoAds");
 	if (!noAds || !orig) {
 		return orig;
 	}
-	
+
 	// 强判定：检查是否为广告卡（检查 commonDynamicPatchModel.is_ad == 1）
 	if ([[orig valueForKeyPath:@"commonDynamicPatchModel.is_ad"] integerValue] == 1) {
 		return nil;
 	}
-	
+
 	return orig;
 }
 %end
@@ -5865,6 +8510,7 @@ static NSHashTable *processedParentViews = nil;
 
 - (void)layoutSubviews {
     %orig;
+    DYYYDisableExtendedRangeForLayer(self.layer);
     UIViewController *vc = [DYYYUtils firstAvailableViewControllerFromView:self];
     Class playVCClass = NSClassFromString(@"AWEPlayVideoViewController");
     if (vc && playVCClass && [vc isKindOfClass:playVCClass]) {
@@ -5884,32 +8530,511 @@ static NSHashTable *processedParentViews = nil;
 - (void)layoutSubviews {
     %orig;
 
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYHideFollowPromptView"]) {
+    if (DYYYGetBool(@"DYYYHideAvatarButton")) {
+        DYYYHideAvatarVisualForSelector(self, NSSelectorFromString(@"userAvatarView"));
+    }
+
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)didMoveToSuperview {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)updateRightContainerElement {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)p_resetFollowAnimation {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)playFollowAnimation:(id)completion {
+    %orig(completion);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)playUnFollowAnimation {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)changeSendMessageViewWithFlag:(BOOL)flag {
+    %orig(flag);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+%end
+
+%hook AWEPlayInteractionUserAvatarFollowPromptController
+- (void)onFollowViewClicked:(UITapGestureRecognizer *)gesture {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
         return;
     }
 
-    static char kDYAvatarCacheKey;
-    NSArray *viewCache = objc_getAssociatedObject(self, &kDYAvatarCacheKey);
-    if (!viewCache) {
-        NSMutableArray *tmp = [NSMutableArray array];
-        for (UIView *subview in self.subviews) {
-            if ([subview isMemberOfClass:[UIView class]]) {
-                [tmp addObject:subview];
+    if (DYYYGetBool(@"DYYYFollowTips")) {
+        AWEPlayInteractionUserAvatarContext *context = nil;
+        if ([self respondsToSelector:@selector(userAvatarContext)]) {
+            context = [self valueForKey:@"userAvatarContext"];
+        }
+
+        AWEUserModel *author = context.model.author;
+        NSString *nickname = @"";
+        NSString *signature = @"";
+        NSString *avatarURL = @"";
+
+        if (author) {
+            if ([author respondsToSelector:@selector(nickname)]) {
+                nickname = [author valueForKey:@"nickname"] ?: @"";
+            }
+
+            if ([author respondsToSelector:@selector(signature)]) {
+                signature = [author valueForKey:@"signature"] ?: @"";
+            }
+
+            if ([author respondsToSelector:@selector(avatarThumb)]) {
+                AWEURLModel *avatarThumb = [author valueForKey:@"avatarThumb"];
+                if (avatarThumb && avatarThumb.originURLList.count > 0) {
+                    avatarURL = avatarThumb.originURLList.firstObject;
+                }
             }
         }
-        viewCache = [tmp copy];
-        objc_setAssociatedObject(self, &kDYAvatarCacheKey, viewCache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
 
-    for (UIView *container in viewCache) {
-        for (UIView *child in container.subviews) {
-            child.alpha = 0.0;
+        NSMutableString *messageContent = [NSMutableString string];
+        if (signature.length > 0) {
+            [messageContent appendFormat:@"%@", signature];
         }
+
+        NSString *title = nickname.length > 0 ? nickname : @"关注确认";
+
+        [DYYYBottomAlertView showAlertWithTitle:title
+                                        message:messageContent
+                                      avatarURL:avatarURL
+                               cancelButtonText:@"取消"
+                              confirmButtonText:@"关注"
+                                   cancelAction:nil
+                                    closeAction:nil
+                                  confirmAction:^{
+                                    %orig(gesture);
+                                  }];
+    } else {
+        %orig;
+    }
+}
+
+- (void)onUnFollowViewClicked:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return;
+    }
+    %orig(arg1);
+}
+
+- (void)followPromptViewClicked:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return;
+    }
+    %orig(arg1);
+}
+
+- (void)layoutElementView {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (BOOL)shouldShowFollowAddWithModel:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return NO;
+    }
+    return %orig(arg1);
+}
+
+- (BOOL)shouldShowSpecialFollowWithModel:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return NO;
+    }
+    return %orig(arg1);
+}
+
+- (void)showFollowAddView:(BOOL)show {
+    %orig(show);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_willDisplay {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_viewDidAppear {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)updateFollowStatus {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)followStatusChanged:(id)arg1 {
+    %orig(arg1);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)playFollowAnimation {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)playFollowAnimation:(id)completion {
+    %orig(completion);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)playUnFollowAnimation {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)_ensureStaticFollowAnimationView {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+%end
+
+%hook AWEPlayInteractionUserAvatarMainBusinessController
+- (void)layoutElementView {
+    %orig;
+    if (DYYYGetBool(@"DYYYHideAvatarButton")) {
+        DYYYHideAvatarVisualForSelector(self, NSSelectorFromString(@"avatarPicView"));
+        id context = DYYYAvatarObjectForSelector(self, NSSelectorFromString(@"userAvatarContext"));
+        DYYYHideAvatarVisualForSelector(context, NSSelectorFromString(@"avatarPicView"));
+    }
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+%end
+
+%hook AWEPlayInteractionUserAvatarOptElementElement
+- (void)layoutElementView {
+    %orig;
+    if (DYYYGetBool(@"DYYYHideAvatarButton")) {
+        id context = DYYYAvatarObjectForSelector(self, NSSelectorFromString(@"userAvatarContext"));
+        DYYYHideAvatarVisualForSelector(context, NSSelectorFromString(@"avatarPicView"));
+    }
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_willDisplay {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_viewDidAppear {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)setAppear:(BOOL)appear {
+    %orig(appear);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+%end
+
+%hook AWEPlayInteractionUserAvatarStoryController
+- (void)layoutElementView {
+    %orig;
+    if (DYYYGetBool(@"DYYYHideAvatarRing")) {
+        DYYYHideAvatarVisualForSelector(self, NSSelectorFromString(@"colorRingView"));
+    }
+}
+
+- (void)showStory25RingView {
+    %orig;
+    if (DYYYGetBool(@"DYYYHideAvatarRing")) {
+        DYYYHideAvatarVisualForSelector(self, NSSelectorFromString(@"colorRingView"));
     }
 }
 %end
 
+%hook AWEPlayInteractionUserAvatarDecorationController
+- (void)layoutElementView {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_willDisplay {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)setDecorationStyle:(long long)style {
+    %orig(style);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+%end
+
+%hook AWEPlayInteractionUserAvatarSendMessageController
+- (void)controllerViewDidLayout {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)controllerStartConfigAvatarView:(id)view {
+    %orig(view);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(view);
+}
+
+- (void)controllerWillDisplay {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)controllerPlay {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)controllerReset {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)updateSendMessageView:(BOOL)show {
+    %orig(show);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)p_updateSendMessageView:(BOOL)show {
+    %orig(show);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)p_showSendMessageView:(id)view shouldShowSendMessageView:(BOOL)show animated:(BOOL)animated completion:(id)completion {
+    %orig(view, show, animated, completion);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(view);
+}
+
+- (BOOL)shouldShowSendMessageView {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)shouldShowSendMessageGuideAnimation {
+    if (DYYYAvatarFollowOptionsEnabled()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)playSendMessageGuideAnimationIfNeeded {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)onSendMessageViewClicked:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return;
+    }
+    %orig(arg1);
+}
+%end
+
+%hook AWEPlayInteractionUserAvatarSendMsgController
+- (void)layoutElementView {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_willDisplay {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_viewDidDisappear {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)play {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)reset {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)changeSendMessageViewWithFlag:(BOOL)flag {
+    %orig(flag);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)showSendMessageView:(id)view show:(BOOL)show animated:(BOOL)animated completion:(id)completion {
+    %orig(view, show, animated, completion);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(view);
+}
+
+- (void)showSendMessageViewWithAnimation:(BOOL)animated {
+    %orig(animated);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (BOOL)shouldShowSendMessageView:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return NO;
+    }
+    return %orig(arg1);
+}
+
+- (BOOL)shouldShowSendMessageGuideAnimation {
+    if (DYYYAvatarFollowOptionsEnabled()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)updateSendMsgWithFollowShow:(BOOL)show animation:(BOOL)animated {
+    %orig(show, animated);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)handleAvatarFollowStatusChange:(id)arg1 {
+    %orig(arg1);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)playSendMessageGuideAnimationIfNeeded {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)onSendMessageViewClicked:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return;
+    }
+    %orig(arg1);
+}
+%end
+
+%hook AWEPlayInteractionUserAvatarEnterStoreController
+- (void)layoutElementView {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_willDisplay {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)viewController_viewDidAppear {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)play {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)reset {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)showEnterStore {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)hideEnterStore {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (BOOL)shouldShowEnterStoreView {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)shouldShowEnterStoreGuideAnimation {
+    if (DYYYAvatarFollowOptionsEnabled()) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (void)playEnterStoreGuideAnimationIfNeeded {
+    if (DYYYAvatarFollowOptionsEnabled()) {
+        DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+        return;
+    }
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)handleAvatarFollowStatusChange:(id)arg1 {
+    %orig(arg1);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)onEnterStoreViewClicked:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return;
+    }
+    %orig(arg1);
+}
+%end
+
+%hook AWEPlayInteractionUserAvatarAdLinkController
+- (void)layoutElementView {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)reset {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)updateCommerceHotSplashLinkIconImageIfNeeded:(id)arg1 {
+    %orig(arg1);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)onLinkIconContainerViewClicked:(id)arg1 {
+    if (DYYYGetBool(@"DYYYHideFollowPromptView")) {
+        return;
+    }
+    %orig(arg1);
+}
+%end
+
 %hook AWEPlayInteractionViewController
+
+- (void)performCommentAction {
+    %orig;
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
+
+- (void)setIsCommentVCShowing:(BOOL)showing {
+    %orig(showing);
+    DYYYApplyAvatarFollowPromptSettingsWithRetry(self);
+}
 
 - (void)onPlayer:(id)arg0 didDoubleClick:(id)arg1 {
     BOOL isPopupEnabled = DYYYGetBool(@"DYYYEnableDoubleTapMenu");
@@ -6394,6 +9519,7 @@ static NSHashTable *processedParentViews = nil;
 static Class barBackgroundClass = nil;
 static Class generalButtonClass = nil;
 static Class plusButtonClass = nil;
+static Class plusInnerButtonClass = nil;
 static Class tabBarButtonClass = nil;
 
 + (void)initialize {
@@ -6401,6 +9527,7 @@ static Class tabBarButtonClass = nil;
         barBackgroundClass = NSClassFromString(@"_UIBarBackground");
         generalButtonClass = %c(AWENormalModeTabBarGeneralButton);
         plusButtonClass = %c(AWENormalModeTabBarGeneralPlusButton);
+        plusInnerButtonClass = %c(AWENormalModeTabBarGeneralPlusInnerButton);
         tabBarButtonClass = %c(UITabBarButton);
     }
 }
@@ -6456,17 +9583,19 @@ static Class tabBarButtonClass = nil;
     BOOL hideMsg = DYYYGetBool(@"DYYYHideMessageButton");
     BOOL hideFri = DYYYGetBool(@"DYYYHideFriendsButton");
     BOOL hideMe = DYYYGetBool(@"DYYYHideMyButton");
+    BOOL hidePlus = DYYYGetBool(@"DYYYHidePlusButton");
     BOOL isPad = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad);
-    BOOL needsButtonRelayout = hideShop || hideMsg || hideFri || hideMe || isPad;
+    BOOL needsButtonRelayout = hideShop || hideMsg || hideFri || hideMe || hidePlus || isPad;
 
     if (needsButtonRelayout) {
         NSMutableArray *visibleButtons = [NSMutableArray array];
         UIView *ipadContainerView = nil;
 
         for (UIView *subview in self.subviews) {
-            if ([subview isKindOfClass:generalButtonClass] || [subview isKindOfClass:plusButtonClass]) {
+            if ([subview isKindOfClass:generalButtonClass] || [subview isKindOfClass:plusButtonClass] || [subview isKindOfClass:plusInnerButtonClass]) {
                 NSString *label = subview.accessibilityLabel;
-                BOOL shouldHide = ([label containsString:@"商城"] && hideShop) || ([label containsString:@"消息"] && hideMsg) || ([label containsString:@"朋友"] && hideFri) ||
+                BOOL isPlusButton = [subview isKindOfClass:plusButtonClass] || [subview isKindOfClass:plusInnerButtonClass] || [label isEqualToString:@"拍摄"];
+                BOOL shouldHide = (isPlusButton && hidePlus) || ([label containsString:@"商城"] && hideShop) || ([label containsString:@"消息"] && hideMsg) || ([label containsString:@"朋友"] && hideFri) ||
                                   ([label isEqualToString:@"我"] && hideMe);
 
                 subview.userInteractionEnabled = !shouldHide;
@@ -6549,7 +9678,7 @@ static Class tabBarButtonClass = nil;
         // 单次遍历处理所有背景和分割线
         for (UIView *subview in self.subviews) {
             // 跳过底栏按钮
-            if ([subview isKindOfClass:generalButtonClass] || [subview isKindOfClass:plusButtonClass]) {
+            if ([subview isKindOfClass:generalButtonClass] || [subview isKindOfClass:plusButtonClass] || [subview isKindOfClass:plusInnerButtonClass]) {
                 continue;
             }
             // 隐藏底栏背景
@@ -6621,7 +9750,7 @@ static Class tabBarButtonClass = nil;
         for (UIView *subview in self.subviews) {
             CGFloat subviewHeight = subview.frame.size.height;
             // 跳过底栏按钮
-            if ([subview isKindOfClass:generalButtonClass] || [subview isKindOfClass:plusButtonClass]) {
+            if ([subview isKindOfClass:generalButtonClass] || [subview isKindOfClass:plusButtonClass] || [subview isKindOfClass:plusInnerButtonClass]) {
                 continue;
             }
             // 隐藏底栏背景
@@ -6701,25 +9830,6 @@ static Class tabBarButtonClass = nil;
     return %orig;
 }
 
-%end
-
-%hook AWENormalModeTabBarGeneralPlusButton
-+ (id)button {
-    BOOL isHidePlusButton = DYYYGetBool(@"DYYYHidePlusButton");
-    if (isHidePlusButton) {
-        return nil;
-    }
-    return %orig;
-}
-%end
-
-%hook AWENormalModeTabBarGeneralPlusInnerButton
-+ (id)buttonWithParams:(id)arg1 {
-    if (DYYYGetBool(@"DYYYHidePlusButton")) {
-        return nil;
-    }
-    return %orig;
-}
 %end
 
 %hook AWENormalModeTabBarTextView
@@ -7073,6 +10183,15 @@ static Class tabBarButtonClass = nil;
     if (hideButton && hideButton.isElementsHidden) {
         for (NSString *className in targetClassNames) {
             if ([view isKindOfClass:NSClassFromString(className)]) {
+                // 动态 alpha 视图（如暂停图标）：只用 hidden 隐藏，不干预 alpha
+                if (DYYYIsDynamicAlphaView(view)) {
+                    view.hidden = YES;
+                    break;
+                }
+                // 在置 0 之前先保存真正的原始 alpha，避免后续 findAndHideViews 记录到 0
+                if (!objc_getAssociatedObject(view, &dyyyClearOriginalAlphaKey)) {
+                    objc_setAssociatedObject(view, &dyyyClearOriginalAlphaKey, @(view.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
                 if ([view isKindOfClass:NSClassFromString(@"AWELeftSideBarEntranceView")]) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                       UIViewController *controller = [hideButton findViewController:view];
@@ -7250,54 +10369,21 @@ static Class tabBarButtonClass = nil;
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     isInPlayInteractionVC = YES;
-    dyyyInteractionViewVisible = YES;
-    updateSpeedButtonVisibility();
-    updateClearButtonVisibility();
+    dyyyCurrentSpeedAweme = self.model;
+    DYYYRestoreFloatSpeedButtonForAwemeIfNeeded(self.model);
+    DYYYEnsureFloatSpeedButton(self);
+    reloadClearButtonConfiguration();
 }
 
 - (void)viewDidLayoutSubviews {
     %orig;
 
-    if (isFloatSpeedButtonEnabled) {
-        BOOL hasRightStack = NO;
-        Class stackClass = NSClassFromString(@"AWEElementStackView");
-        for (UIView *sub in self.view.subviews) {
-            if ([sub isKindOfClass:stackClass] && ([sub.accessibilityLabel isEqualToString:@"right"] || [DYYYUtils containsSubviewOfClass:NSClassFromString(@"AWEPlayInteractionUserAvatarView")
-                                                                                                                              inContainer:self.view])) {
-                hasRightStack = YES;
-                break;
-            }
-        }
-        if (hasRightStack) {
-            if (speedButton == nil) {
-                speedButtonSize = [[NSUserDefaults standardUserDefaults] floatForKey:@"DYYYSpeedButtonSize"] ?: 32.0;
-                CGRect screenBounds = [UIScreen mainScreen].bounds;
-                CGRect initialFrame = CGRectMake((screenBounds.size.width - speedButtonSize) / 2, (screenBounds.size.height - speedButtonSize) / 2, speedButtonSize, speedButtonSize);
-                speedButton = [[FloatingSpeedButton alloc] initWithFrame:initialFrame];
-                speedButton.interactionController = self;
-                showSpeedX = [[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYSpeedButtonShowX"];
-                updateSpeedButtonUI();
-            } else {
-                [speedButton resetButtonState];
-                if (speedButton.interactionController == nil || speedButton.interactionController != self) {
-                    speedButton.interactionController = self;
-                }
-                if (speedButton.frame.size.width != speedButtonSize) {
-                    CGPoint center = speedButton.center;
-                    CGRect newFrame = CGRectMake(0, 0, speedButtonSize, speedButtonSize);
-                    speedButton.frame = newFrame;
-                    speedButton.center = center;
-                    speedButton.layer.cornerRadius = speedButtonSize / 2;
-                }
-            }
-            dyyyInteractionViewVisible = YES;
-            UIWindow *keyWindow = [DYYYUtils getActiveWindow];
-            if (keyWindow && ![speedButton isDescendantOfView:keyWindow]) {
-                [keyWindow addSubview:speedButton];
-                [speedButton loadSavedPosition];
-                [speedButton resetFadeTimer];
-            }
-        }
+    if (self.view.window && !self.view.hidden) {
+        DYYYEnsureFloatSpeedButton(self);
+        reloadClearButtonConfiguration();
+    } else {
+        [FloatingSpeedButton reloadConfiguration];
+        updateClearButtonVisibility();
     }
 
     UIWindow *keyWindow = [DYYYUtils getActiveWindow];
@@ -7348,24 +10434,19 @@ static Class tabBarButtonClass = nil;
     }
 
     if (!useFullHeight && [currentReferString isEqualToString:@"chat"]) {
-        static NSNumber *shouldRestoreChat = nil;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-          BOOL includeChat = NO;
-          Class managerClass = %c(AWEVersionUpdateManager);
-          if (managerClass && [managerClass respondsToSelector:@selector(sharedInstance)]) {
-              AWEVersionUpdateManager *manager = [managerClass sharedInstance];
-              if ([manager respondsToSelector:@selector(currentVersion)]) {
-                  NSString *currentVersion = manager.currentVersion;
-                  if (currentVersion.length > 0) {
-                      includeChat = ([DYYYUtils compareVersion:currentVersion toVersion:@"35.5.0"] == NSOrderedAscending);
-                  }
-              }
-          }
-          shouldRestoreChat = @(includeChat);
-        });
+        NSString *currentVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+        if (currentVersion.length == 0) {
+            Class managerClass = %c(AWEVersionUpdateManager);
+            if (managerClass && [managerClass respondsToSelector:@selector(sharedInstance)]) {
+                AWEVersionUpdateManager *manager = [managerClass sharedInstance];
+                if ([manager respondsToSelector:@selector(currentVersion)]) {
+                    currentVersion = manager.currentVersion;
+                }
+            }
+        }
 
-        if (shouldRestoreChat.boolValue) {
+        // 39.2.0 及更早版本的私信播放页以完整高度布局信息区，否则底部约束会整体上移。 （靠版本号判断不靠谱，这个是 abtest 的）
+        if (currentVersion.length > 0 && [DYYYUtils compareVersion:currentVersion toVersion:@"39.2.0"] != NSOrderedDescending) {
             useFullHeight = YES;
         }
     }
@@ -7383,19 +10464,19 @@ static Class tabBarButtonClass = nil;
 
 - (void)viewDidDisappear:(BOOL)animated {
     %orig;
-    BOOL hasRightStack = NO;
-    Class stackClass = NSClassFromString(@"AWEElementStackView");
-    for (UIView *sub in self.view.subviews) {
-        if ([sub isKindOfClass:stackClass] && ([sub.accessibilityLabel isEqualToString:@"right"] || [DYYYUtils containsSubviewOfClass:NSClassFromString(@"AWEPlayInteractionUserAvatarView")
-                                                                                                                          inContainer:self.view])) {
-            hasRightStack = YES;
-            break;
+    if (dyyyActiveSpeedInteractionController == self) {
+        AWEPlayInteractionViewController *replacementController = DYYYResolveCurrentSpeedInteractionController(nil);
+        if (replacementController && replacementController != self) {
+            DYYYEnsureFloatSpeedButton(replacementController);
+        } else {
+            dyyyActiveSpeedInteractionController = nil;
+            dyyyInteractionViewVisible = NO;
+            dyyyCommentViewVisible = self.isCommentVCShowing;
+            updateSpeedButtonVisibility();
+            dispatch_async(dispatch_get_main_queue(), ^{
+              DYYYEnsureFloatSpeedButton(nil);
+            });
         }
-    }
-    if (hasRightStack) {
-        dyyyInteractionViewVisible = NO;
-        dyyyCommentViewVisible = self.isCommentVCShowing;
-        updateSpeedButtonVisibility();
         updateClearButtonVisibility();
     }
 }
@@ -7413,21 +10494,8 @@ static Class tabBarButtonClass = nil;
     setCurrentSpeedIndex(newIndex);
 
     float newSpeed = [speeds[newIndex] floatValue];
-
-    NSString *formattedSpeed;
-    if (fmodf(newSpeed, 1.0) == 0) {
-        formattedSpeed = [NSString stringWithFormat:@"%.0f", newSpeed];
-    } else if (fmodf(newSpeed * 10, 1.0) == 0) {
-        formattedSpeed = [NSString stringWithFormat:@"%.1f", newSpeed];
-    } else {
-        formattedSpeed = [NSString stringWithFormat:@"%.2f", newSpeed];
-    }
-
-    if (showSpeedX) {
-        formattedSpeed = [formattedSpeed stringByAppendingString:@"x"];
-    }
-
-    [sender setTitle:formattedSpeed forState:UIControlStateNormal];
+    updateSpeedButtonUI();
+    DYYYClearLongPressSpeedState();
 
     [UIView animateWithDuration:0.1
         delay:0
@@ -7445,32 +10513,11 @@ static Class tabBarButtonClass = nil;
                            completion:nil];
         }];
 
-    BOOL speedApplied = NO;
-
-    UIWindow *win = [DYYYUtils getActiveWindow];
-    UIViewController *rootVC = win.rootViewController;
-    while (rootVC && rootVC.presentedViewController) {
-        rootVC = rootVC.presentedViewController;
+    AWEPlayInteractionViewController *currentController = DYYYResolveCurrentSpeedInteractionController(self);
+    if (currentController) {
+        speedButton.interactionController = currentController;
     }
-
-    NSArray *viewControllers = rootVC ? findViewControllersInHierarchy(rootVC) : @[];
-
-    for (UIViewController *vc in viewControllers) {
-        if ([vc isKindOfClass:%c(AWEAwemePlayVideoViewController)]) {
-            [(AWEAwemePlayVideoViewController *)vc setVideoControllerPlaybackRate:newSpeed];
-            speedApplied = YES;
-        }
-        if ([vc isKindOfClass:%c(AWEDPlayerFeedPlayerViewController)]) {
-            [(AWEDPlayerFeedPlayerViewController *)vc setVideoControllerPlaybackRate:newSpeed];
-            speedApplied = YES;
-        }
-        if ([vc isKindOfClass:objc_getClass("AWEDPlayerViewController_Merge")]) {
-            [(AWEAwemePlayVideoViewController *)vc setVideoControllerPlaybackRate:newSpeed];
-            speedApplied = YES;
-        }
-    }
-
-    if (!speedApplied) {
+    if (!DYYYApplyPlaybackSpeed(currentController, newSpeed)) {
         [DYYYUtils showToast:@"无法找到视频控制器"];
     }
 }
@@ -7499,25 +10546,7 @@ static Class tabBarButtonClass = nil;
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
     %orig(arg0);
-    if (!DYYYShouldHandleSpeedFeatures()) {
-        return;
-    }
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-      if ([[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYUserAgreementAccepted"]) {
-          float defaultSpeed = [[NSUserDefaults standardUserDefaults] floatForKey:@"DYYYDefaultSpeed"];
-          if (defaultSpeed > 0 && defaultSpeed != 1) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                [self setVideoControllerPlaybackRate:defaultSpeed];
-              });
-          }
-      }
-      float speed = getCurrentSpeed();
-      if (speed != 1.0) {
-          dispatch_async(dispatch_get_main_queue(), ^{
-            [self adjustPlaybackSpeed:speed];
-          });
-      }
-    });
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
@@ -7526,14 +10555,7 @@ static Class tabBarButtonClass = nil;
         return;
     }
 
-    BOOL autoRestoreSpeed = [[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYAutoRestoreSpeed"];
-    if (autoRestoreSpeed) {
-        setCurrentSpeedIndex(0);
-    }
-    float speed = getCurrentSpeed();
-    if (speed != 1.0) {
-        [self adjustPlaybackSpeed:speed];
-    }
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
     updateSpeedButtonUI();
 }
 
@@ -7546,6 +10568,13 @@ static Class tabBarButtonClass = nil;
 
 %hook AWEDPlayerFeedPlayerViewController
 
+- (BOOL)enableHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
 - (void)viewDidLayoutSubviews {
     %orig;
     if (DYYYGetBool(@"DYYYEnableFullScreen")) {
@@ -7567,25 +10596,7 @@ static Class tabBarButtonClass = nil;
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
     %orig(arg0);
-    if (!DYYYShouldHandleSpeedFeatures()) {
-        return;
-    }
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-      if ([[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYUserAgreementAccepted"]) {
-          float defaultSpeed = [[NSUserDefaults standardUserDefaults] floatForKey:@"DYYYDefaultSpeed"];
-          if (defaultSpeed > 0 && defaultSpeed != 1) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                [self setVideoControllerPlaybackRate:defaultSpeed];
-              });
-          }
-      }
-      float speed = getCurrentSpeed();
-      if (speed != 1.0) {
-          dispatch_async(dispatch_get_main_queue(), ^{
-            [self adjustPlaybackSpeed:speed];
-          });
-      }
-    });
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
@@ -7593,14 +10604,7 @@ static Class tabBarButtonClass = nil;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
-    BOOL autoRestoreSpeed = [[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYAutoRestoreSpeed"];
-    if (autoRestoreSpeed) {
-        setCurrentSpeedIndex(0);
-    }
-    float speed = getCurrentSpeed();
-    if (speed != 1.0) {
-        [self adjustPlaybackSpeed:speed];
-    }
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
     updateSpeedButtonUI();
 }
 
@@ -7613,6 +10617,13 @@ static Class tabBarButtonClass = nil;
 
 %hook AWEDPlayerViewController_Merge
 
+- (BOOL)enableHDR {
+    if (DYYYShouldDisableAllHDR()) {
+        return NO;
+    }
+    return %orig;
+}
+
 - (void)viewDidLayoutSubviews {
     %orig;
     if (DYYYGetBool(@"DYYYEnableFullScreen")) {
@@ -7634,25 +10645,7 @@ static Class tabBarButtonClass = nil;
 
 - (void)setIsAutoPlay:(BOOL)arg0 {
     %orig(arg0);
-    if (!DYYYShouldHandleSpeedFeatures()) {
-        return;
-    }
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-      if ([[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYUserAgreementAccepted"]) {
-          float defaultSpeed = [[NSUserDefaults standardUserDefaults] floatForKey:@"DYYYDefaultSpeed"];
-          if (defaultSpeed > 0 && defaultSpeed != 1) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                [self setVideoControllerPlaybackRate:defaultSpeed];
-              });
-          }
-      }
-      float speed = getCurrentSpeed();
-      if (speed != 1.0) {
-          dispatch_async(dispatch_get_main_queue(), ^{
-            [self adjustPlaybackSpeed:speed];
-          });
-      }
-    });
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
 }
 
 - (void)prepareForDisplay {
@@ -7660,14 +10653,7 @@ static Class tabBarButtonClass = nil;
     if (!DYYYShouldHandleSpeedFeatures()) {
         return;
     }
-    BOOL autoRestoreSpeed = [[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYAutoRestoreSpeed"];
-    if (autoRestoreSpeed) {
-        setCurrentSpeedIndex(0);
-    }
-    float speed = getCurrentSpeed();
-    if (speed != 1.0) {
-        [self adjustPlaybackSpeed:speed];
-    }
+    DYYYApplyPreparedPlaybackSpeedToPlayer(self);
     updateSpeedButtonUI();
 }
 
@@ -7747,11 +10733,13 @@ static Class tabBarButtonClass = nil;
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     isPureViewVisible = YES;
+    updateClearButtonVisibility();
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
     %orig;
     isPureViewVisible = NO;
+    updateClearButtonVisibility();
 }
 %end
 
@@ -7768,6 +10756,7 @@ static Class tabBarButtonClass = nil;
         [hideButton hideUIElements];
     }
     %orig;
+    DYYYHandleCurrentSpeedAwemeChanged(arg1);
 }
 
 - (void)viewWillLayoutSubviews {
@@ -7817,57 +10806,31 @@ static void DYYYRemoveKeyboardObserver(void) {
 
     [[NSUserDefaults standardUserDefaults] addObserver:(NSObject *)self forKeyPath:kDYYYGlobalTransparencyKey options:NSKeyValueObservingOptionNew context:DYYYGlobalTransparencyContext];
 
-    BOOL isEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYEnableFloatClearButton"];
-    if (isEnabled) {
-        if (hideButton) {
-            [hideButton removeFromSuperview];
-            hideButton = nil;
-        }
+    reloadClearButtonConfiguration();
+    DYYYRemoveAppLifecycleObservers();
 
-        CGFloat buttonSize = [[NSUserDefaults standardUserDefaults] floatForKey:@"DYYYEnableFloatClearButtonSize"] ?: 40.0;
-        hideButton = [[HideUIButton alloc] initWithFrame:CGRectMake(0, 0, buttonSize, buttonSize)];
-        hideButton.alpha = 0.5;
+    dyyyWindowKeyObserverToken = [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
+                                                                                   object:nil
+                                                                                    queue:[NSOperationQueue mainQueue]
+                                                                               usingBlock:^(NSNotification *_Nonnull notification) {
+                                                                                 reloadClearButtonConfiguration();
+                                                                               }];
 
-        NSString *savedPositionString = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYHideUIButtonPosition"];
-        if (savedPositionString) {
-            hideButton.center = CGPointFromString(savedPositionString);
-        } else {
-            CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
-            CGFloat screenHeight = [UIScreen mainScreen].bounds.size.height;
-            hideButton.center = CGPointMake(screenWidth - buttonSize / 2 - 5, screenHeight / 2);
-        }
+    dyyyDidBecomeActiveToken = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                                                 object:nil
+                                                                                  queue:[NSOperationQueue mainQueue]
+                                                                             usingBlock:^(NSNotification *_Nonnull notification) {
+                                                                               isAppActive = YES;
+                                                                               reloadClearButtonConfiguration();
+                                                                             }];
 
-        hideButton.hidden = NO;
-        [getKeyWindow() addSubview:hideButton];
-        updateClearButtonVisibility();
-
-        DYYYRemoveAppLifecycleObservers();
-
-        dyyyWindowKeyObserverToken = [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
-                                                                                       object:nil
-                                                                                        queue:[NSOperationQueue mainQueue]
-                                                                                   usingBlock:^(NSNotification *_Nonnull notification) {
-                                                                                     updateClearButtonVisibility();
-                                                                                   }];
-
-        dyyyDidBecomeActiveToken = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                                                     object:nil
-                                                                                      queue:[NSOperationQueue mainQueue]
-                                                                                 usingBlock:^(NSNotification *_Nonnull notification) {
-                                                                                   isAppActive = YES;
-                                                                                   updateClearButtonVisibility();
-                                                                                 }];
-
-        dyyyWillResignActiveToken = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillResignActiveNotification
-                                                                                      object:nil
-                                                                                       queue:[NSOperationQueue mainQueue]
-                                                                                  usingBlock:^(NSNotification *_Nonnull notification) {
-                                                                                    isAppActive = NO;
-                                                                                    updateClearButtonVisibility();
-                                                                                  }];
-    } else {
-        DYYYRemoveAppLifecycleObservers();
-    }
+    dyyyWillResignActiveToken = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillResignActiveNotification
+                                                                                  object:nil
+                                                                                   queue:[NSOperationQueue mainQueue]
+                                                                              usingBlock:^(NSNotification *_Nonnull notification) {
+                                                                                isAppActive = NO;
+                                                                                updateClearButtonVisibility();
+                                                                              }];
 
     return result;
 }
@@ -7885,7 +10848,7 @@ static void DYYYRemoveKeyboardObserver(void) {
         [[NSUserDefaults standardUserDefaults] removeObserver:(NSObject *)self forKeyPath:kDYYYGlobalTransparencyKey context:DYYYGlobalTransparencyContext];
     } @catch (NSException *exception) {
         NSLog(@"[DYYY] KVO removeObserver failed: %@", exception);
-    } 
+    }
     %orig;
 }
 
@@ -8681,8 +11644,33 @@ static Class TagViewClass = nil;
 %end
 
 %hook UIImageView
+- (void)setImage:(UIImage *)image {
+    DYYYApplySDRDynamicRangeToImageView(self);
+    %orig;
+    DYYYApplySDRDynamicRangeToImageView(self);
+}
+
+- (void)setHighlightedImage:(UIImage *)highlightedImage {
+    DYYYApplySDRDynamicRangeToImageView(self);
+    %orig;
+    DYYYApplySDRDynamicRangeToImageView(self);
+}
+
+- (void)setAnimationImages:(NSArray<UIImage *> *)animationImages {
+    DYYYApplySDRDynamicRangeToImageView(self);
+    %orig;
+    DYYYApplySDRDynamicRangeToImageView(self);
+}
+
+- (void)setHighlightedAnimationImages:(NSArray<UIImage *> *)highlightedAnimationImages {
+    DYYYApplySDRDynamicRangeToImageView(self);
+    %orig;
+    DYYYApplySDRDynamicRangeToImageView(self);
+}
+
 - (void)layoutSubviews {
     %orig;
+    DYYYApplySDRDynamicRangeToImageView(self);
     if (DYYYGetBool(@"DYYYHideCommentDiscover")) {
         if (!self.accessibilityLabel) {
             UIView *parentView = self.superview;
@@ -8880,6 +11868,7 @@ static NSString *const kHideRecentUsersKey = @"DYYYHideSidebarRecentUsers";
 
 - (void)layoutSubviews {
     %orig;
+    DYYYApplyFloatClearProgressStateToView(self);
 
     if (![[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYEnableFullScreen"]) {
         return;
@@ -8939,11 +11928,17 @@ static void findTargetViewInView(UIView *view) {
 }
 
 %ctor {
+    [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+        @"DYYYDisableFeedNowPlayingInfo" : @YES
+    }];
+
+    DYYYMigrateCombinedHDRModeIfNeeded();
+
     Class interactionBaseLabelClass = objc_getClass("AWECommentSwiftBizUI.CommentInteractionBaseLabel");
     if (interactionBaseLabelClass) {
         %init(DYYYCommentExactTimeGroup, AWECommentSwiftBizUI_CommentInteractionBaseLabel = interactionBaseLabelClass);
     }
-    
+
     Class imMenuComponentClass = objc_getClass("AWEIMCustomMenuComponent");
     if (imMenuComponentClass) {
         SEL legacySelector = NSSelectorFromString(@"msg_showMenuForBubbleFrameInScreen:tapLocationInScreen:menuItemList:moreEmoticon:onCell:extra:");
@@ -8978,8 +11973,7 @@ static void findTargetViewInView(UIView *view) {
             DYYYGetBool(@"DYYYForceDownloadCommentImage")) {
             %init(EnableStickerSaveMenu);
         }
-        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        isFloatSpeedButtonEnabled = [defaults boolForKey:@"DYYYEnableFloatSpeedButton"];
+        [FloatingSpeedButton reloadConfiguration];
 
         // 初始化红包激励挂件容器视图类组
         Class incentivePendantClass = objc_getClass("AWEIncentiveSwiftImplDOUYINLite.IncentivePendantContainerView");
