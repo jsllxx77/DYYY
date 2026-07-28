@@ -1104,8 +1104,20 @@
         void (^completionBlock)(BOOL success, NSURL *fileURL) = self.completionBlocks[downloadIDForTask];
 
         if (error.code != NSURLErrorCancelled) {
+            NSArray<NSURL *> *candidateURLs = self.downloadCandidateURLs[downloadIDForTask];
+            NSInteger attemptedCount = [self.downloadCandidateIndexes[downloadIDForTask] integerValue] + 1;
+            NSInteger totalCount = candidateURLs.count;
+            NSString *failedHost = task.currentRequest.URL.host ?: task.originalRequest.URL.host ?: @"未知域名";
+            NSString *errorDomain = error.domain.length > 0 ? error.domain : @"未知错误";
+            NSString *diagnosticMessage = [NSString stringWithFormat:@"下载失败 %ld/%ld\n%@\n%@ (%ld)",
+                                                                       (long)attemptedCount,
+                                                                       (long)totalCount,
+                                                                       failedHost,
+                                                                       errorDomain,
+                                                                       (long)error.code];
+            NSLog(@"[DYYY] %@", [diagnosticMessage stringByReplacingOccurrencesOfString:@"\n" withString:@" | "]);
             dispatch_async(dispatch_get_main_queue(), ^{
-              [DYYYUtils showToast:@"下载失败"];
+              [DYYYUtils showToast:diagnosticMessage];
             });
         }
 
