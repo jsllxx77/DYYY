@@ -29,6 +29,8 @@
 @property(nonatomic, strong) NSMutableDictionary<NSString *, void (^)(BOOL success, NSURL *fileURL)> *completionBlocks;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *mediaTypeMap;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *filePathToDownloadID;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSArray<NSURL *> *> *downloadCandidateURLs;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *downloadCandidateIndexes;
 
 // 批量下载相关属性
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *downloadToBatchMap;                                                 // 下载ID到批量ID的映射
@@ -37,6 +39,14 @@
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *batchTotalCountMap;                                                 // 批量ID到总数量的映射
 @property(nonatomic, strong) NSMutableDictionary<NSString *, void (^)(NSInteger current, NSInteger total)> *batchProgressBlocks;              // 批量进度回调
 @property(nonatomic, strong) NSMutableDictionary<NSString *, void (^)(NSInteger successCount, NSInteger totalCount)> *batchCompletionBlocks;  // 批量完成回调
++ (void)downloadMediaWithProgressFromURLs:(NSArray<NSURL *> *)urls
+                                 mediaType:(MediaType)mediaType
+                                     audio:(NSURL *)audioURL
+                                  progress:(void (^)(float progress))progressBlock
+                                completion:(void (^)(BOOL success, NSURL *fileURL))completion;
+- (BOOL)startDownloadForID:(NSString *)downloadID;
+- (BOOL)retryDownloadForID:(NSString *)downloadID;
+- (void)handleDownloadFailureForTask:(NSURLSessionTask *)task error:(NSError *)error;
 @end
 
 @implementation DYYYManager
@@ -62,6 +72,8 @@
         _completionBlocks = [NSMutableDictionary dictionary];
         _mediaTypeMap = [NSMutableDictionary dictionary];
         _filePathToDownloadID = [NSMutableDictionary dictionary];
+        _downloadCandidateURLs = [NSMutableDictionary dictionary];
+        _downloadCandidateIndexes = [NSMutableDictionary dictionary];
 
         // 初始化批量下载相关字典
         _downloadToBatchMap = [NSMutableDictionary dictionary];
@@ -432,11 +444,37 @@
 }
 
 + (void)downloadMedia:(NSURL *)url mediaType:(MediaType)mediaType audio:(NSURL *)audioURL completion:(void (^)(BOOL success))completion {
-    [self downloadMediaWithProgress:url
-                          mediaType:mediaType
-                              audio:audioURL
-                           progress:nil
-                         completion:^(BOOL success, NSURL *fileURL) {
+    NSArray<NSURL *> *urls = url ? @[ url ] : @[];
+    [self downloadMediaFromURLs:urls mediaType:mediaType audio:audioURL completion:completion];
+}
+
++ (void)downloadMediaFromURLs:(NSArray<NSURL *> *)urls
+                    mediaType:(MediaType)mediaType
+                        audio:(NSURL *)audioURL
+                   completion:(void (^)(BOOL success))completion {
+    NSMutableArray<NSURL *> *validURLs = [NSMutableArray array];
+    NSMutableSet<NSString *> *seenURLs = [NSMutableSet set];
+    for (NSURL *candidateURL in urls) {
+        if (![candidateURL isKindOfClass:[NSURL class]] || candidateURL.absoluteString.length == 0 || [seenURLs containsObject:candidateURL.absoluteString]) {
+            continue;
+        }
+        [seenURLs addObject:candidateURL.absoluteString];
+        [validURLs addObject:candidateURL];
+    }
+
+    if (validURLs.count == 0) {
+        [DYYYUtils showToast:@"没有找到可用的视频地址"];
+        if (completion) {
+            completion(NO);
+        }
+        return;
+    }
+
+    [self downloadMediaWithProgressFromURLs:validURLs
+                                  mediaType:mediaType
+                                      audio:audioURL
+                                   progress:nil
+                                 completion:^(BOOL success, NSURL *fileURL) {
                            void (^notifyCompletion)(BOOL) = ^(BOOL result) {
                                if (completion) {
                                    completion(result);
@@ -503,6 +541,15 @@
                             audio:(NSURL *)audioURL
                          progress:(void (^)(float progress))progressBlock
                        completion:(void (^)(BOOL success, NSURL *fileURL))completion {
+    NSArray<NSURL *> *urls = url ? @[ url ] : @[];
+    [self downloadMediaWithProgressFromURLs:urls mediaType:mediaType audio:audioURL progress:progressBlock completion:completion];
+}
+
++ (void)downloadMediaWithProgressFromURLs:(NSArray<NSURL *> *)urls
+                                 mediaType:(MediaType)mediaType
+                                     audio:(NSURL *)audioURL
+                                  progress:(void (^)(float progress))progressBlock
+                                completion:(void (^)(BOOL success, NSURL *fileURL))completion {
     // 创建自定义进度条界面
     dispatch_async(dispatch_get_main_queue(), ^{
       // 创建进度视图
@@ -518,22 +565,40 @@
       // 保存回调
       [[DYYYManager shared] setCompletionBlock:completion forDownloadID:downloadID];
       [[DYYYManager shared] setMediaType:mediaType forDownloadID:downloadID];
-
-      // 配置下载会话 - 使用带委托的会话以获取进度更新
-      NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
-      NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration delegate:[DYYYManager shared] delegateQueue:[NSOperationQueue mainQueue]];
-
-      // 创建下载任务 - 不使用completionHandler，使用代理方法
-      NSURLSessionDownloadTask *downloadTask = [session downloadTaskWithURL:url];
-      downloadTask.taskDescription = downloadID;
-
-      // 存储下载任务
-      [[DYYYManager shared].downloadTasks setObject:downloadTask forKey:downloadID];
+      [DYYYManager shared].downloadCandidateURLs[downloadID] = [urls copy];
+      [DYYYManager shared].downloadCandidateIndexes[downloadID] = @0;
       [[DYYYManager shared].taskProgressMap setObject:@0.0 forKey:downloadID];  // 初始化进度为0
-
-      // 开始下载
-      [downloadTask resume];
+      [[DYYYManager shared] startDownloadForID:downloadID];
     });
+}
+
+- (BOOL)startDownloadForID:(NSString *)downloadID {
+    NSArray<NSURL *> *candidateURLs = self.downloadCandidateURLs[downloadID];
+    NSInteger candidateIndex = [self.downloadCandidateIndexes[downloadID] integerValue];
+    if (candidateIndex >= candidateURLs.count) {
+        return NO;
+    }
+
+    NSURL *url = candidateURLs[candidateIndex];
+    NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration delegate:self delegateQueue:[NSOperationQueue mainQueue]];
+    NSURLSessionDownloadTask *downloadTask = [session downloadTaskWithURL:url];
+    downloadTask.taskDescription = downloadID;
+    self.downloadTasks[downloadID] = downloadTask;
+    self.taskProgressMap[downloadID] = @0.0f;
+    [downloadTask resume];
+    return YES;
+}
+
+- (BOOL)retryDownloadForID:(NSString *)downloadID {
+    NSArray<NSURL *> *candidateURLs = self.downloadCandidateURLs[downloadID];
+    NSInteger nextIndex = [self.downloadCandidateIndexes[downloadID] integerValue] + 1;
+    if (nextIndex >= candidateURLs.count) {
+        return NO;
+    }
+
+    self.downloadCandidateIndexes[downloadID] = @(nextIndex);
+    return [self startDownloadForID:downloadID];
 }
 
 // 取消所有下载
@@ -574,6 +639,8 @@
 
     [[DYYYManager shared].downloadTasks removeAllObjects];
     [[DYYYManager shared].progressViews removeAllObjects];
+    [[DYYYManager shared].downloadCandidateURLs removeAllObjects];
+    [[DYYYManager shared].downloadCandidateIndexes removeAllObjects];
 }
 
 + (void)downloadAllImages:(NSMutableArray *)imageURLs {
@@ -812,6 +879,8 @@
     }
 
     [self removeMappingsForDownloadID:downloadID];
+    [self.downloadCandidateURLs removeObjectForKey:downloadID];
+    [self.downloadCandidateIndexes removeObjectForKey:downloadID];
 
     dispatch_async(dispatch_get_main_queue(), ^{
       DYYYToast *progressView = self.progressViews[downloadID];
@@ -895,6 +964,17 @@
 
     if (!downloadIDForTask) {
         return;
+    }
+
+    if ([downloadTask.response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSInteger statusCode = [(NSHTTPURLResponse *)downloadTask.response statusCode];
+        if (statusCode < 200 || statusCode >= 300) {
+            NSError *statusError = [NSError errorWithDomain:@"DYYYDownloadError"
+                                                       code:statusCode
+                                                   userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"HTTP %ld", (long)statusCode]}];
+            [self handleDownloadFailureForTask:downloadTask error:statusError];
+            return;
+        }
     }
 
     // 检查是否属于批量下载
@@ -984,7 +1064,10 @@
         return;  // 成功完成的情况已在didFinishDownloadingToURL处理
     }
 
-    // 处理错误情况
+    [self handleDownloadFailureForTask:task error:error];
+}
+
+- (void)handleDownloadFailureForTask:(NSURLSessionTask *)task error:(NSError *)error {
     NSString *downloadIDForTask = nil;
     for (NSString *key in self.downloadTasks.allKeys) {
         NSURLSessionTask *existingTask = self.downloadTasks[key];
@@ -1001,6 +1084,11 @@
     // 检查是否属于批量下载
     NSString *batchID = self.downloadToBatchMap[downloadIDForTask];
     BOOL isBatchDownload = (batchID != nil);
+
+    if (!isBatchDownload && error.code != NSURLErrorCancelled && [self retryDownloadForID:downloadIDForTask]) {
+        NSLog(@"[DYYY] 下载地址失败，切换备用地址: %@", error.localizedDescription);
+        return;
+    }
 
     if (isBatchDownload) {
         // 批量下载错误处理

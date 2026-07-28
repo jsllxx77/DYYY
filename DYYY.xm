@@ -4025,6 +4025,28 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
 }
 %end
 
+static void DYYYAppendURLModelCandidates(NSMutableArray<NSURL *> *candidates, AWEURLModel *urlModel) {
+    if (!urlModel || urlModel.originURLList.count == 0) {
+        return;
+    }
+
+    for (NSString *urlString in urlModel.originURLList) {
+        NSURL *url = [NSURL URLWithString:urlString];
+        if (url) {
+            [candidates addObject:url];
+        }
+    }
+}
+
+static void DYYYAppendBitrateCandidates(NSMutableArray<NSURL *> *candidates, NSArray *bitrateModels) {
+    for (id bitrateModel in bitrateModels) {
+        AWEURLModel *playAddress = [bitrateModel valueForKey:@"playAddr"];
+        if ([playAddress isKindOfClass:%c(AWEURLModel)]) {
+            DYYYAppendURLModelCandidates(candidates, playAddress);
+        }
+    }
+}
+
 // 获取资源的地址
 %hook AWEURLModel
 %new - (NSURL *)getDYYYSrcURLDownload {
@@ -9158,13 +9180,20 @@ static NSHashTable *processedParentViews = nil;
                                                       }];
                               }
                           } else {
-                              if (videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-                                  NSURL *url = [NSURL URLWithString:videoModel.h264URL.originURLList.firstObject];
-                                  [DYYYManager downloadMedia:url
-                                                   mediaType:MediaTypeVideo
-                                                       audio:audioURL
-                                                  completion:^(BOOL success){
-                                                  }];
+                              NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
+                              DYYYAppendURLModelCandidates(videoURLs, (AWEURLModel *)videoModel.h264URL);
+                              DYYYAppendURLModelCandidates(videoURLs, videoModel.playURL);
+                              DYYYAppendBitrateCandidates(videoURLs, videoModel.manualBitrateModels);
+                              DYYYAppendBitrateCandidates(videoURLs, videoModel.bitrateModels);
+
+                              if (videoURLs.count > 0) {
+                                  [DYYYManager downloadMediaFromURLs:videoURLs
+                                                           mediaType:MediaTypeVideo
+                                                               audio:audioURL
+                                                          completion:^(BOOL success){
+                                                          }];
+                              } else {
+                                  [DYYYUtils showToast:@"没有找到可用的视频地址"];
                               }
                           }
                         }];
