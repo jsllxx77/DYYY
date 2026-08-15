@@ -12106,66 +12106,98 @@ static BOOL DYYYIsDUXVisualEffectView(UIView *view) {
     return [NSStringFromClass([view class]) isEqualToString:@"DUXVisualEffectView"];
 }
 
-%hook UIVisualEffectView
-- (void)setFrame:(CGRect)frame {
-    if (DYYYIsDUXVisualEffectView(self)) {
-        DYYYDUXTrace(@"DUXVisualEffectView setFrame %@ (prev %@)", NSStringFromCGRect(frame), NSStringFromCGRect(self.frame));
-    }
-    %orig;
-}
-- (void)setCenter:(CGPoint)center {
-    if (DYYYIsDUXVisualEffectView(self)) {
-        DYYYDUXTrace(@"DUXVisualEffectView setCenter %@ (prev %@)", NSStringFromCGPoint(center), NSStringFromCGPoint(self.center));
-    }
-    %orig;
-}
-- (void)setTransform:(CGAffineTransform)transform {
-    if (DYYYIsDUXVisualEffectView(self)) {
-        DYYYDUXTrace(@"DUXVisualEffectView setTransform %@", NSStringFromCGAffineTransform(transform));
-    }
-    %orig;
-}
-- (void)setAlpha:(CGFloat)alpha {
-    if (DYYYIsDUXVisualEffectView(self)) {
-        DYYYDUXTrace(@"DUXVisualEffectView setAlpha %.3f (prev %.3f)", alpha, self.alpha);
-    }
-    %orig;
-}
-- (void)didMoveToWindow {
-    if (DYYYIsDUXVisualEffectView(self)) {
-        DYYYDUXTrace(@"DUXVisualEffectView didMoveToWindow win=%@ frame=%@", self.window ? @"YES" : @"nil", NSStringFromCGRect(self.frame));
-    }
-    %orig;
-}
-- (void)willMoveToWindow:(UIWindow *)newWindow {
-    if (DYYYIsDUXVisualEffectView(self)) {
-        DYYYDUXTrace(@"DUXVisualEffectView willMoveToWindow %@ frame=%@", newWindow ? @"new" : @"nil", NSStringFromCGRect(self.frame));
-    }
-    %orig;
-}
-%end
-
 static BOOL DYYYIsDUXContentSheet(UIViewController *vc) {
     return [NSStringFromClass([vc class]) isEqualToString:@"DUXContentSheet"];
 }
 
-%hook UIViewController
-- (void)viewWillDisappear:(BOOL)animated {
-    if (DYYYIsDUXContentSheet(self)) {
-        DYYYDUXTrace(@"DUXContentSheet viewWillDisappear animated=%d frame=%@", animated, NSStringFromCGRect(self.view.frame));
+// 运行时 hook：DUXVisualEffectView 轨迹 + DUXContentSheet dismiss 调用栈
+static IMP gOrigDUXSetFrame = NULL;
+static IMP gOrigDUXSetCenter = NULL;
+static IMP gOrigDUXSetTransform = NULL;
+static IMP gOrigDUXSetAlpha = NULL;
+static IMP gOrigDUXDidMoveToWindow = NULL;
+static IMP gOrigDUXWillMoveToWindow = NULL;
+static IMP gOrigDUXDismissAnimated = NULL;
+
+static void DYYYTraceDUXSetFrame(id self, SEL _cmd, CGRect frame) {
+    if (gOrigDUXSetFrame) {
+        ((void (*)(id, SEL, CGRect))gOrigDUXSetFrame)(self, _cmd, frame);
     }
-    %orig(animated);
-}
-- (void)viewDidDisappear:(BOOL)animated {
-    if (DYYYIsDUXContentSheet(self)) {
-        DYYYDUXTrace(@"DUXContentSheet viewDidDisappear animated=%d", animated);
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setFrame %@", NSStringFromCGRect(frame));
     }
-    %orig(animated);
 }
-- (void)dismissViewControllerAnimated:(BOOL)animated completion:(void (^)(void))completion {
-    if (DYYYIsDUXContentSheet(self)) {
-        DYYYDUXTrace(@"DUXContentSheet dismissViewControllerAnimated animated=%d\n%@", animated, [NSThread callStackSymbols]);
+static void DYYYTraceDUXSetCenter(id self, SEL _cmd, CGPoint center) {
+    if (gOrigDUXSetCenter) {
+        ((void (*)(id, SEL, CGPoint))gOrigDUXSetCenter)(self, _cmd, center);
     }
-    %orig(animated, completion);
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setCenter %@", NSStringFromCGPoint(center));
+    }
 }
-%end
+static void DYYYTraceDUXSetTransform(id self, SEL _cmd, CGAffineTransform transform) {
+    if (gOrigDUXSetTransform) {
+        ((void (*)(id, SEL, CGAffineTransform))gOrigDUXSetTransform)(self, _cmd, transform);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setTransform %@", NSStringFromCGAffineTransform(transform));
+    }
+}
+static void DYYYTraceDUXSetAlpha(id self, SEL _cmd, CGFloat alpha) {
+    if (gOrigDUXSetAlpha) {
+        ((void (*)(id, SEL, CGFloat))gOrigDUXSetAlpha)(self, _cmd, alpha);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setAlpha %.3f", alpha);
+    }
+}
+static void DYYYTraceDUXDidMoveToWindow(id self, SEL _cmd) {
+    if (gOrigDUXDidMoveToWindow) {
+        ((void (*)(id, SEL))gOrigDUXDidMoveToWindow)(self, _cmd);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView didMoveToWindow win=%@ frame=%@", [self window] ? @"YES" : @"nil", NSStringFromCGRect([self frame]));
+    }
+}
+static void DYYYTraceDUXWillMoveToWindow(id self, SEL _cmd, UIWindow *newWindow) {
+    if (gOrigDUXWillMoveToWindow) {
+        ((void (*)(id, SEL, UIWindow *))gOrigDUXWillMoveToWindow)(self, _cmd, newWindow);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView willMoveToWindow %@ frame=%@", newWindow ? @"new" : @"nil", NSStringFromCGRect([self frame]));
+    }
+}
+static void DYYYTraceDUXDismissAnimated(id self, SEL _cmd, BOOL animated, void (^completion)(void)) {
+    DYYYDUXTrace(@"DUXContentSheet dismissViewControllerAnimated animated=%d\n%@", animated, [NSThread callStackSymbols]);
+    if (gOrigDUXDismissAnimated) {
+        ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigDUXDismissAnimated)(self, _cmd, animated, completion);
+    }
+}
+
+static void DYYYInstallDUXTraceHooks(void) {
+    Class duxClass = objc_getClass("DUXVisualEffectView");
+    if (duxClass) {
+        Method m = NULL;
+        m = class_getInstanceMethod(duxClass, @selector(setFrame:));
+        if (m) { gOrigDUXSetFrame = method_getImplementation(m); class_addMethod(duxClass, @selector(setFrame:), (IMP)DYYYTraceDUXSetFrame, "v@:{CGRect=dddd}"); }
+        m = class_getInstanceMethod(duxClass, @selector(setCenter:));
+        if (m) { gOrigDUXSetCenter = method_getImplementation(m); class_addMethod(duxClass, @selector(setCenter:), (IMP)DYYYTraceDUXSetCenter, "v@:{CGPoint=dd}"); }
+        m = class_getInstanceMethod(duxClass, @selector(setTransform:));
+        if (m) { gOrigDUXSetTransform = method_getImplementation(m); class_addMethod(duxClass, @selector(setTransform:), (IMP)DYYYTraceDUXSetTransform, "v@:{CGAffineTransform=dddddd}"); }
+        m = class_getInstanceMethod(duxClass, @selector(setAlpha:));
+        if (m) { gOrigDUXSetAlpha = method_getImplementation(m); class_addMethod(duxClass, @selector(setAlpha:), (IMP)DYYYTraceDUXSetAlpha, "v@:d"); }
+        m = class_getInstanceMethod(duxClass, @selector(didMoveToWindow));
+        if (m) { gOrigDUXDidMoveToWindow = method_getImplementation(m); class_addMethod(duxClass, @selector(didMoveToWindow), (IMP)DYYYTraceDUXDidMoveToWindow, "v@:"); }
+        m = class_getInstanceMethod(duxClass, @selector(willMoveToWindow:));
+        if (m) { gOrigDUXWillMoveToWindow = method_getImplementation(m); class_addMethod(duxClass, @selector(willMoveToWindow:), (IMP)DYYYTraceDUXWillMoveToWindow, "v@:@"); }
+    }
+    Class sheetClass = objc_getClass("DUXContentSheet");
+    if (sheetClass) {
+        Method m = class_getInstanceMethod(sheetClass, @selector(dismissViewControllerAnimated:completion:));
+        if (m) { gOrigDUXDismissAnimated = method_getImplementation(m); class_addMethod(sheetClass, @selector(dismissViewControllerAnimated:completion:), (IMP)DYYYTraceDUXDismissAnimated, "v@:B@?"); }
+    }
+}
+
+%ctor {
+    DYYYInstallDUXTraceHooks();
+}
