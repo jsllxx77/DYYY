@@ -12473,7 +12473,66 @@ static void DYYYInstallDUXAncestorHooks(void) {
     }
 }
 
+// ============ DUXSheetNavigationController 关闭接管（build.12 确定性修复） ============
+// 轨迹实锤：分享面板宿主 = DUXSheetNavigationController，dismiss 后 176ms 即 win=nil（官方快速转场）
+// 方案：接管 dismiss，面板 0.35s 慢速滑出底部 + 遮罩淡出 → 再无动画 dismiss
+static IMP gOrigDUXSheetDismiss = NULL;
+
+static void DYYYFixDUXSheetDismiss(id self, SEL _cmd, BOOL animated, void (^completion)(void)) {
+    UIView *panel = gActiveDUXPanelView;
+    if (animated && panel && panel.window) {
+        DYYYDUXTrace(@"🔧 接管 DUXSheetNavigationController dismiss（自定义 0.35s 慢速下滑关闭）");
+        UIView *dismissMask = nil;
+        for (UIView *sub in panel.superview.subviews) {
+            if ([NSStringFromClass([sub class]) isEqualToString:@"DUXAccessibilityDismissView"]) {
+                dismissMask = sub;
+                break;
+            }
+        }
+        [UIView animateWithDuration:0.35
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{
+            CGRect f = panel.frame;
+            f.origin.y = panel.window.bounds.size.height;
+            panel.frame = f;
+            if (dismissMask) {
+                dismissMask.alpha = 0.0;
+            }
+        } completion:^(BOOL finished) {
+            if (gOrigDUXSheetDismiss) {
+                ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigDUXSheetDismiss)(self, _cmd, NO, completion);
+            } else if (completion) {
+                completion();
+            }
+        }];
+    } else {
+        DYYYDUXTrace(@"DUXSheetNavigationController dismiss animated=%d panel=%@", animated, panel ? @"YES" : @"nil");
+        if (gOrigDUXSheetDismiss) {
+            ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigDUXSheetDismiss)(self, _cmd, animated, completion);
+        }
+    }
+}
+
+static void DYYYInstallDUXSheetDismissFix(void) {
+    Class sheetNavClass = objc_getClass("DUXSheetNavigationController");
+    if (!sheetNavClass) {
+        return;
+    }
+    SEL dismissSel = @selector(dismissViewControllerAnimated:completion:);
+    Method m = class_getInstanceMethod(sheetNavClass, dismissSel);
+    if (!m) {
+        return;
+    }
+    gOrigDUXSheetDismiss = method_getImplementation(m);
+    if (!class_addMethod(sheetNavClass, dismissSel, (IMP)DYYYFixDUXSheetDismiss, "v@:B@?")) {
+        method_setImplementation(m, (IMP)DYYYFixDUXSheetDismiss);
+    }
+    DYYYDUXTrace(@"DUXSheetNavigationController dismiss 接管已安装");
+}
+
 %ctor {
     DYYYInstallDUXTraceHooks();
     DYYYInstallDUXAncestorHooks();
+    DYYYInstallDUXSheetDismissFix();
 }
