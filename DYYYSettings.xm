@@ -43,6 +43,7 @@ static BOOL DYYYBuildingSettingsSearchIndex = NO;
 static BOOL DYYYSettingsSearchIndexBuilt = NO;
 
 // 视图树诊断模式：定时 dump 全部 window 视图树，用于定位分享面板等未知视图
+// 注意：主线程遍历视图树较重，间隔拉长到 8 秒并加 autoreleasepool，避免动画期间卡死被系统杀
 static AWMSafeDispatchTimer *gViewTreeDumpTimer = nil;
 
 static void DYYYSetViewTreeDumpMode(BOOL enabled) {
@@ -52,24 +53,26 @@ static void DYYYSetViewTreeDumpMode(BOOL enabled) {
         }
         if (!gViewTreeDumpTimer.isRunning) {
             __weak AWMSafeDispatchTimer *weakTimer = gViewTreeDumpTimer;
-            [gViewTreeDumpTimer startWithInterval:2.0
-                                          leeway:0.5
+            [gViewTreeDumpTimer startWithInterval:8.0
+                                          leeway:2.0
                                            queue:dispatch_get_main_queue()
                                          repeats:YES
                                          handler:^{
-                AWMSafeDispatchTimer *strongTimer = weakTimer;
-                if (!strongTimer) {
-                    return;
+                @autoreleasepool {
+                    AWMSafeDispatchTimer *strongTimer = weakTimer;
+                    if (!strongTimer) {
+                        return;
+                    }
+                    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+                    NSString *documentsDirectory = paths.firstObject;
+                    NSString *dyyyFolderPath = [documentsDirectory stringByAppendingPathComponent:@"DYYY"];
+                    NSFileManager *fileManager = [NSFileManager defaultManager];
+                    if (![fileManager fileExistsAtPath:dyyyFolderPath]) {
+                        [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:nil];
+                    }
+                    NSString *dumpPath = [dyyyFolderPath stringByAppendingPathComponent:@"view_tree_diag.txt"];
+                    [DYYYUtils dumpAllWindowsViewTreeToFile:dumpPath];
                 }
-                NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-                NSString *documentsDirectory = paths.firstObject;
-                NSString *dyyyFolderPath = [documentsDirectory stringByAppendingPathComponent:@"DYYY"];
-                NSFileManager *fileManager = [NSFileManager defaultManager];
-                if (![fileManager fileExistsAtPath:dyyyFolderPath]) {
-                    [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:nil];
-                }
-                NSString *dumpPath = [dyyyFolderPath stringByAppendingPathComponent:@"view_tree_diag.txt"];
-                [DYYYUtils dumpAllWindowsViewTreeToFile:dumpPath];
             }];
         }
     } else {
