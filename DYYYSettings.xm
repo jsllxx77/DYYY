@@ -43,7 +43,8 @@ static BOOL DYYYBuildingSettingsSearchIndex = NO;
 static BOOL DYYYSettingsSearchIndexBuilt = NO;
 
 // 视图树诊断模式：定时 dump 全部 window 视图树，用于定位分享面板等未知视图
-// 注意：主线程遍历视图树较重，间隔拉长到 8 秒并加 autoreleasepool，避免动画期间卡死被系统杀
+// 每次抓取写入带时间戳的新文件（不覆盖），保留最近 30 份，便于回溯面板打开瞬间的状态
+// 注意：主线程遍历视图树较重，间隔 8 秒并加 autoreleasepool，避免动画期间卡死被系统杀
 static AWMSafeDispatchTimer *gViewTreeDumpTimer = nil;
 
 static void DYYYSetViewTreeDumpMode(BOOL enabled) {
@@ -70,8 +71,29 @@ static void DYYYSetViewTreeDumpMode(BOOL enabled) {
                     if (![fileManager fileExistsAtPath:dyyyFolderPath]) {
                         [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:nil];
                     }
-                    NSString *dumpPath = [dyyyFolderPath stringByAppendingPathComponent:@"view_tree_diag.txt"];
+                    // 带时间戳文件名，不覆盖历史抓取
+                    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+                    [formatter setDateFormat:@"yyyyMMdd_HHmmss"];
+                    NSString *stamp = [formatter stringFromDate:[NSDate date]];
+                    NSString *dumpPath = [dyyyFolderPath stringByAppendingPathComponent:[NSString stringWithFormat:@"view_tree_%@.txt", stamp]];
                     [DYYYUtils dumpAllWindowsViewTreeToFile:dumpPath];
+
+                    // 清理旧文件，只保留最近 30 份
+                    NSArray *files = [fileManager contentsOfDirectoryAtPath:dyyyFolderPath error:nil];
+                    NSMutableArray *dumpFiles = [NSMutableArray array];
+                    for (NSString *file in files) {
+                        if ([file hasPrefix:@"view_tree_"] && [file hasSuffix:@".txt"]) {
+                            [dumpFiles addObject:file];
+                        }
+                    }
+                    [dumpFiles sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+                        return [a compare:b];
+                    }];
+                    while (dumpFiles.count > 30) {
+                        NSString *oldest = dumpFiles.firstObject;
+                        [fileManager removeItemAtPath:[dyyyFolderPath stringByAppendingPathComponent:oldest] error:nil];
+                        [dumpFiles removeObjectAtIndex:0];
+                    }
                 }
             }];
         }
