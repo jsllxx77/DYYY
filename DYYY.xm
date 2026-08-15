@@ -12092,6 +12092,11 @@ static void DYYYDUXTrace(NSString *format, ...) {
     [formatter setDateFormat:@"HH:mm:ss.SSS"];
     NSString *line = [NSString stringWithFormat:@"%@ %@\n", [formatter stringFromDate:[NSDate date]], message];
     NSString *filePath = DYYYDUXTraceFilePath();
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSDictionary *attrs = [fileManager attributesOfItemAtPath:filePath error:nil];
+    if (attrs && [attrs[NSFileSize] longLongValue] > 500 * 1024) {
+        [fileManager removeItemAtPath:filePath error:nil];
+    }
     NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:filePath];
     if (!fileHandle) {
         [line writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -12111,6 +12116,7 @@ static BOOL DYYYIsDUXContentSheet(UIViewController *vc) {
 }
 
 // 运行时 hook：DUXVisualEffectView 轨迹 + DUXContentSheet dismiss 调用栈
+static __weak UIView *gActiveDUXPanelView = nil;
 static IMP gOrigDUXSetFrame = NULL;
 static IMP gOrigDUXSetCenter = NULL;
 static IMP gOrigDUXSetTransform = NULL;
@@ -12156,7 +12162,23 @@ static void DYYYTraceDUXDidMoveToWindow(id self, SEL _cmd) {
         ((void (*)(id, SEL))gOrigDUXDidMoveToWindow)(self, _cmd);
     }
     if (DYYYIsDUXVisualEffectView(self)) {
-        DYYYDUXTrace(@"DUXVisualEffectView didMoveToWindow win=%@ frame=%@", [self window] ? @"YES" : @"nil", NSStringFromCGRect([self frame]));
+        BOOL inWindow = ([self window] != nil);
+        DYYYDUXTrace(@"DUXVisualEffectView didMoveToWindow win=%@ frame=%@", inWindow ? @"YES" : @"nil", NSStringFromCGRect([self frame]));
+        // 面板出现：记录活动面板 + 祖先链类名；消失：清空
+        if (inWindow) {
+            gActiveDUXPanelView = self;
+            NSMutableString *chain = [NSMutableString string];
+            UIView *cur = self;
+            int depth = 0;
+            while (cur && depth < 14) {
+                [chain appendFormat:@"%d=%@(%@) ", depth, NSStringFromClass([cur class]), NSStringFromCGRect(cur.frame)];
+                cur = cur.superview;
+                depth++;
+            }
+            DYYYDUXTrace(@"面板出现 祖先链: %@", chain);
+        } else {
+            gActiveDUXPanelView = nil;
+        }
     }
 }
 static void DYYYTraceDUXWillMoveToWindow(id self, SEL _cmd, UIWindow *newWindow) {
@@ -12198,6 +12220,101 @@ static void DYYYInstallDUXTraceHooks(void) {
     }
 }
 
+// ============ DUX 面板祖先容器动画追踪（build.10） ============
+// 轨迹证明：关闭时面板本体零动画帧，动画由外层容器执行
+// 全局追踪：活动面板的祖先视图 setTransform/setCenter + 影响面板的 UIView 动画时长
+
+static IMP gOrigUIViewSetTransform = NULL;
+static IMP gOrigUIViewSetCenter = NULL;
+static IMP gOrigAnimateWithDurationOptions = NULL;
+static IMP gOrigAnimateWithDurationBlock = NULL;
+
+static void DYYYTraceContainerSetTransform(id self, SEL _cmd, CGAffineTransform transform) {
+    if (gOrigUIViewSetTransform) {
+        ((void (*)(id, SEL, CGAffineTransform))gOrigUIViewSetTransform)(self, _cmd, transform);
+    }
+    UIView *panel = gActiveDUXPanelView;
+    if (panel && panel != self && [panel isDescendantOfView:self] && !CGAffineTransformIsIdentity(transform)) {
+        DYYYDUXTrace(@"容器[%@] setTransform %@ frame=%@", NSStringFromClass([self class]), NSStringFromCGAffineTransform(transform), NSStringFromCGRect([self frame]));
+    }
+}
+
+static void DYYYTraceContainerSetCenter(id self, SEL _cmd, CGPoint center) {
+    if (gOrigUIViewSetCenter) {
+        ((void (*)(id, SEL, CGPoint))gOrigUIViewSetCenter)(self, _cmd, center);
+    }
+    UIView *panel = gActiveDUXPanelView;
+    if (panel && panel != self && [panel isDescendantOfView:self]) {
+        DYYYDUXTrace(@"容器[%@] setCenter %@ frame=%@", NSStringFromClass([self class]), NSStringFromCGPoint(center), NSStringFromCGRect([self frame]));
+    }
+}
+
+static void DYYYTraceAnimateWithDurationOptions(id self, SEL _cmd, NSTimeInterval duration, NSTimeInterval delay, UIViewAnimationOptions options, void (^animations)(void), void (^completion)(BOOL finished)) {
+    UIView *panel = gActiveDUXPanelView;
+    if (panel && duration > 0 && duration < 0.5) {
+        CGRect beforeFrame = panel.frame;
+        CGAffineTransform beforeT = panel.transform;
+        if (gOrigAnimateWithDurationOptions) {
+            ((void (*)(id, SEL, NSTimeInterval, NSTimeInterval, UIViewAnimationOptions, void (^)(void), void (^)(BOOL)))gOrigAnimateWithDurationOptions)(self, _cmd, duration, delay, options, ^{
+                if (animations) animations();
+            }, completion);
+        }
+        CGRect afterFrame = panel.frame;
+        CGAffineTransform afterT = panel.transform;
+        if (!CGRectEqualToRect(beforeFrame, afterFrame) || !CGAffineTransformEqualToTransform(beforeT, afterT)) {
+            DYYYDUXTrace(@"⚠️ 影响面板的UIView动画 duration=%.3f delay=%.3f options=0x%lx", duration, delay, (unsigned long)options);
+        }
+    } else if (gOrigAnimateWithDurationOptions) {
+        ((void (*)(id, SEL, NSTimeInterval, NSTimeInterval, UIViewAnimationOptions, void (^)(void), void (^)(BOOL)))gOrigAnimateWithDurationOptions)(self, _cmd, duration, delay, options, animations, completion);
+    }
+}
+
+static void DYYYTraceAnimateWithDurationBlock(id self, SEL _cmd, NSTimeInterval duration, void (^animations)(void), void (^completion)(BOOL finished)) {
+    UIView *panel = gActiveDUXPanelView;
+    if (panel && duration > 0 && duration < 0.5) {
+        CGRect beforeFrame = panel.frame;
+        CGAffineTransform beforeT = panel.transform;
+        if (gOrigAnimateWithDurationBlock) {
+            ((void (*)(id, SEL, NSTimeInterval, void (^)(void), void (^)(BOOL)))gOrigAnimateWithDurationBlock)(self, _cmd, duration, ^{
+                if (animations) animations();
+            }, completion);
+        }
+        CGRect afterFrame = panel.frame;
+        CGAffineTransform afterT = panel.transform;
+        if (!CGRectEqualToRect(beforeFrame, afterFrame) || !CGAffineTransformEqualToTransform(beforeT, afterT)) {
+            DYYYDUXTrace(@"⚠️ 影响面板的UIView动画 duration=%.3f (无delay版)", duration);
+        }
+    } else if (gOrigAnimateWithDurationBlock) {
+        ((void (*)(id, SEL, NSTimeInterval, void (^)(void), void (^)(BOOL)))gOrigAnimateWithDurationBlock)(self, _cmd, duration, animations, completion);
+    }
+}
+
+static void DYYYInstallDUXAncestorHooks(void) {
+    Class uiview = [UIView class];
+    Method m = class_getInstanceMethod(uiview, @selector(setTransform:));
+    if (m) {
+        gOrigUIViewSetTransform = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceContainerSetTransform);
+    }
+    m = class_getInstanceMethod(uiview, @selector(setCenter:));
+    if (m) {
+        gOrigUIViewSetCenter = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceContainerSetCenter);
+    }
+    // 类方法：+animateWithDuration:delay:options:animations:completion:
+    m = class_getClassMethod(uiview, @selector(animateWithDuration:delay:options:animations:completion:));
+    if (m) {
+        gOrigAnimateWithDurationOptions = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceAnimateWithDurationOptions);
+    }
+    m = class_getClassMethod(uiview, @selector(animateWithDuration:animations:completion:));
+    if (m) {
+        gOrigAnimateWithDurationBlock = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceAnimateWithDurationBlock);
+    }
+}
+
 %ctor {
     DYYYInstallDUXTraceHooks();
+    DYYYInstallDUXAncestorHooks();
 }
