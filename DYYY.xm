@@ -12069,36 +12069,419 @@ static void findTargetViewInView(UIView *view) {
     }
 }
 
+// ============ DUX 分享面板动画轨迹诊断（分享面板关闭动画排查） ============
+// 视图树已确认分享面板 = DUXVisualEffectView + DUXContentSheet 容器（原生 UIKit，非 Compose）
+// 记录面板关闭动画的 frame/transform/alpha 轨迹到 Documents/DYYY/DUXPanelTrace.txt
+static NSString *DYYYDUXTraceFilePath(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *documentsDirectory = paths.firstObject;
+    NSString *dyyyFolderPath = [documentsDirectory stringByAppendingPathComponent:@"DYYY"];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    if (![fileManager fileExistsAtPath:dyyyFolderPath]) {
+        [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    return [dyyyFolderPath stringByAppendingPathComponent:@"DUXPanelTrace.txt"];
+}
 
-// ============ DUX 分享面板关闭修复（39.x 分享面板快速滑动消失问题） ============
-// 根因：分享面板宿主 DUXSheetNavigationController 的官方关闭转场极快（约 0.17s），
-// 面板从顶部快速滑落消失。方案：接管 dismiss，自定义 0.35s 慢速下滑关闭。
-static __weak UIView *gActiveDUXPanelView = nil;
-static IMP gOrigDUXDidMoveToWindow = NULL;
-static IMP gOrigDUXDismissAnimated = NULL;
+static void DYYYDUXTrace(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"HH:mm:ss.SSS"];
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [formatter stringFromDate:[NSDate date]], message];
+    NSString *filePath = DYYYDUXTraceFilePath();
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSDictionary *attrs = [fileManager attributesOfItemAtPath:filePath error:nil];
+    if (attrs && [attrs[NSFileSize] longLongValue] > 500 * 1024) {
+        [fileManager removeItemAtPath:filePath error:nil];
+    }
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:filePath];
+    if (!fileHandle) {
+        [line writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    }
+}
 
 static BOOL DYYYIsDUXVisualEffectView(UIView *view) {
     return [NSStringFromClass([view class]) isEqualToString:@"DUXVisualEffectView"];
 }
 
-// 维护活动面板引用：DUXVisualEffectView 进入/离开 window 时更新
-static void DYYYTrackDUXPanelWindow(id self, SEL _cmd) {
+static BOOL DYYYIsDUXContentSheet(UIViewController *vc) {
+    return [NSStringFromClass([vc class]) isEqualToString:@"DUXContentSheet"];
+}
+
+// 运行时 hook：DUXVisualEffectView 轨迹 + DUXContentSheet dismiss 调用栈
+static __weak UIView *gActiveDUXPanelView = nil;
+static BOOL gDUXPanelClosing = NO;
+static IMP gOrigDUXSetFrame = NULL;
+static IMP gOrigDUXSetCenter = NULL;
+static IMP gOrigDUXSetTransform = NULL;
+static IMP gOrigDUXSetAlpha = NULL;
+static IMP gOrigDUXDidMoveToWindow = NULL;
+static IMP gOrigDUXWillMoveToWindow = NULL;
+static IMP gOrigDUXDismissAnimated = NULL;
+
+static void DYYYTraceDUXSetFrame(id self, SEL _cmd, CGRect frame) {
+    if (gOrigDUXSetFrame) {
+        ((void (*)(id, SEL, CGRect))gOrigDUXSetFrame)(self, _cmd, frame);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setFrame %@", NSStringFromCGRect(frame));
+    }
+}
+static void DYYYTraceDUXSetCenter(id self, SEL _cmd, CGPoint center) {
+    if (gOrigDUXSetCenter) {
+        ((void (*)(id, SEL, CGPoint))gOrigDUXSetCenter)(self, _cmd, center);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setCenter %@", NSStringFromCGPoint(center));
+    }
+}
+static void DYYYTraceDUXSetTransform(id self, SEL _cmd, CGAffineTransform transform) {
+    if (gOrigDUXSetTransform) {
+        ((void (*)(id, SEL, CGAffineTransform))gOrigDUXSetTransform)(self, _cmd, transform);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setTransform %@", NSStringFromCGAffineTransform(transform));
+    }
+}
+static void DYYYTraceDUXSetAlpha(id self, SEL _cmd, CGFloat alpha) {
+    if (gOrigDUXSetAlpha) {
+        ((void (*)(id, SEL, CGFloat))gOrigDUXSetAlpha)(self, _cmd, alpha);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setAlpha %.3f", alpha);
+    }
+}
+static void DYYYTraceDUXDidMoveToWindow(id self, SEL _cmd) {
     if (gOrigDUXDidMoveToWindow) {
         ((void (*)(id, SEL))gOrigDUXDidMoveToWindow)(self, _cmd);
     }
     if (DYYYIsDUXVisualEffectView(self)) {
-        if ([self window]) {
+        BOOL inWindow = ([self window] != nil);
+        DYYYDUXTrace(@"DUXVisualEffectView didMoveToWindow win=%@ frame=%@", inWindow ? @"YES" : @"nil", NSStringFromCGRect([self frame]));
+        // 面板出现：记录活动面板 + 祖先链类名；消失：清空
+        if (inWindow) {
             gActiveDUXPanelView = self;
+            NSMutableString *chain = [NSMutableString string];
+            UIView *cur = self;
+            int depth = 0;
+            while (cur && depth < 14) {
+                [chain appendFormat:@"%d=%@(%@) ", depth, NSStringFromClass([cur class]), NSStringFromCGRect(cur.frame)];
+                cur = cur.superview;
+                depth++;
+            }
+            DYYYDUXTrace(@"面板出现 祖先链: %@", chain);
         } else {
             gActiveDUXPanelView = nil;
+            // 关闭开始：开启 1.5s 追踪窗口（快照/转场动画发生在这个窗口内）
+            gDUXPanelClosing = YES;
+            DYYYDUXTrace(@"面板关闭开始（1.5s 追踪窗口开启）");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                gDUXPanelClosing = NO;
+            });
+        }
+    }
+}
+static void DYYYTraceDUXWillMoveToWindow(id self, SEL _cmd, UIWindow *newWindow) {
+    if (gOrigDUXWillMoveToWindow) {
+        ((void (*)(id, SEL, UIWindow *))gOrigDUXWillMoveToWindow)(self, _cmd, newWindow);
+    }
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView willMoveToWindow %@ frame=%@", newWindow ? @"new" : @"nil", NSStringFromCGRect([self frame]));
+    }
+}
+static void DYYYTraceDUXDismissAnimated(id self, SEL _cmd, BOOL animated, void (^completion)(void)) {
+    DYYYDUXTrace(@"DUXContentSheet dismissViewControllerAnimated animated=%d\n%@", animated, [NSThread callStackSymbols]);
+    if (gOrigDUXDismissAnimated) {
+        ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigDUXDismissAnimated)(self, _cmd, animated, completion);
+    }
+}
+
+static void DYYYInstallDUXTraceHooks(void) {
+    Class duxClass = objc_getClass("DUXVisualEffectView");
+    if (duxClass) {
+        Method m = NULL;
+        m = class_getInstanceMethod(duxClass, @selector(setFrame:));
+        if (m) { gOrigDUXSetFrame = method_getImplementation(m); class_addMethod(duxClass, @selector(setFrame:), (IMP)DYYYTraceDUXSetFrame, "v@:{CGRect=dddd}"); }
+        m = class_getInstanceMethod(duxClass, @selector(setCenter:));
+        if (m) { gOrigDUXSetCenter = method_getImplementation(m); class_addMethod(duxClass, @selector(setCenter:), (IMP)DYYYTraceDUXSetCenter, "v@:{CGPoint=dd}"); }
+        m = class_getInstanceMethod(duxClass, @selector(setTransform:));
+        if (m) { gOrigDUXSetTransform = method_getImplementation(m); class_addMethod(duxClass, @selector(setTransform:), (IMP)DYYYTraceDUXSetTransform, "v@:{CGAffineTransform=dddddd}"); }
+        m = class_getInstanceMethod(duxClass, @selector(setAlpha:));
+        if (m) { gOrigDUXSetAlpha = method_getImplementation(m); class_addMethod(duxClass, @selector(setAlpha:), (IMP)DYYYTraceDUXSetAlpha, "v@:d"); }
+        m = class_getInstanceMethod(duxClass, @selector(didMoveToWindow));
+        if (m) { gOrigDUXDidMoveToWindow = method_getImplementation(m); class_addMethod(duxClass, @selector(didMoveToWindow), (IMP)DYYYTraceDUXDidMoveToWindow, "v@:"); }
+        m = class_getInstanceMethod(duxClass, @selector(willMoveToWindow:));
+        if (m) { gOrigDUXWillMoveToWindow = method_getImplementation(m); class_addMethod(duxClass, @selector(willMoveToWindow:), (IMP)DYYYTraceDUXWillMoveToWindow, "v@:@"); }
+    }
+    Class sheetClass = objc_getClass("DUXContentSheet");
+    if (sheetClass) {
+        Method m = class_getInstanceMethod(sheetClass, @selector(dismissViewControllerAnimated:completion:));
+        if (m) { gOrigDUXDismissAnimated = method_getImplementation(m); class_addMethod(sheetClass, @selector(dismissViewControllerAnimated:completion:), (IMP)DYYYTraceDUXDismissAnimated, "v@:B@?"); }
+    }
+}
+
+// ============ DUX 面板祖先容器动画追踪（build.10） ============
+// 轨迹证明：关闭时面板本体零动画帧，动画由外层容器执行
+// 全局追踪：活动面板的祖先视图 setTransform/setCenter + 影响面板的 UIView 动画时长
+
+static IMP gOrigUIViewSetTransform = NULL;
+static IMP gOrigUIViewSetCenter = NULL;
+static IMP gOrigAnimateWithDurationOptions = NULL;
+static IMP gOrigAnimateWithDurationBlock = NULL;
+static IMP gOrigSpringAnimate = NULL;
+static IMP gOrigSnapshotAfterUpdates = NULL;
+static IMP gOrigResizableSnapshot = NULL;
+static IMP gOrigVCPresentAnimated = NULL;
+static IMP gOrigVCDismissAnimated = NULL;
+static IMP gOrigCATransactionDuration = NULL;
+static IMP gOrigAnimatorInitDuration = NULL;
+static IMP gOrigAnimatorInitCurve = NULL;
+
+static void DYYYTraceContainerSetTransform(id self, SEL _cmd, CGAffineTransform transform) {
+    if (gOrigUIViewSetTransform) {
+        ((void (*)(id, SEL, CGAffineTransform))gOrigUIViewSetTransform)(self, _cmd, transform);
+    }
+    UIView *panel = gActiveDUXPanelView;
+    if (panel && panel != self && [panel isDescendantOfView:self] && !CGAffineTransformIsIdentity(transform)) {
+        DYYYDUXTrace(@"容器[%@] setTransform %@ frame=%@", NSStringFromClass([self class]), NSStringFromCGAffineTransform(transform), NSStringFromCGRect([self frame]));
+    }
+}
+
+static void DYYYTraceContainerSetCenter(id self, SEL _cmd, CGPoint center) {
+    if (gOrigUIViewSetCenter) {
+        ((void (*)(id, SEL, CGPoint))gOrigUIViewSetCenter)(self, _cmd, center);
+    }
+    UIView *panel = gActiveDUXPanelView;
+    if (panel && panel != self && [panel isDescendantOfView:self]) {
+        DYYYDUXTrace(@"容器[%@] setCenter %@ frame=%@", NSStringFromClass([self class]), NSStringFromCGPoint(center), NSStringFromCGRect([self frame]));
+    }
+}
+
+static void DYYYTraceAnimateWithDurationOptions(id self, SEL _cmd, NSTimeInterval duration, NSTimeInterval delay, UIViewAnimationOptions options, void (^animations)(void), void (^completion)(BOOL finished)) {
+    UIView *panel = gActiveDUXPanelView;
+    if (gDUXPanelClosing && duration > 0 && duration < 0.3) {
+        // 关闭窗口内：记录所有短动画（快照/转场动画在此）+ 拉长修复
+        DYYYDUXTrace(@"⚠️[关闭中] UIView动画 duration=%.3f→0.35 delay=%.3f options=0x%lx\n%@", duration, delay, (unsigned long)options, [NSThread callStackSymbols]);
+        duration = 0.35;
+    } else if (panel && duration > 0 && duration < 0.5) {
+        CGRect beforeFrame = panel.frame;
+        CGAffineTransform beforeT = panel.transform;
+        if (gOrigAnimateWithDurationOptions) {
+            ((void (*)(id, SEL, NSTimeInterval, NSTimeInterval, UIViewAnimationOptions, void (^)(void), void (^)(BOOL)))gOrigAnimateWithDurationOptions)(self, _cmd, duration, delay, options, ^{
+                if (animations) animations();
+            }, completion);
+        }
+        CGRect afterFrame = panel.frame;
+        CGAffineTransform afterT = panel.transform;
+        if (!CGRectEqualToRect(beforeFrame, afterFrame) || !CGAffineTransformEqualToTransform(beforeT, afterT)) {
+            DYYYDUXTrace(@"⚠️ 影响面板的UIView动画 duration=%.3f delay=%.3f options=0x%lx", duration, delay, (unsigned long)options);
+        }
+        return;
+    }
+    if (gOrigAnimateWithDurationOptions) {
+        ((void (*)(id, SEL, NSTimeInterval, NSTimeInterval, UIViewAnimationOptions, void (^)(void), void (^)(BOOL)))gOrigAnimateWithDurationOptions)(self, _cmd, duration, delay, options, animations, completion);
+    }
+}
+
+static void DYYYTraceAnimateWithDurationBlock(id self, SEL _cmd, NSTimeInterval duration, void (^animations)(void), void (^completion)(BOOL finished)) {
+    UIView *panel = gActiveDUXPanelView;
+    if (gDUXPanelClosing && duration > 0 && duration < 0.3) {
+        DYYYDUXTrace(@"⚠️[关闭中] UIView动画(简版) duration=%.3f→0.35\n%@", duration, [NSThread callStackSymbols]);
+        duration = 0.35;
+    } else if (panel && duration > 0 && duration < 0.5) {
+        CGRect beforeFrame = panel.frame;
+        CGAffineTransform beforeT = panel.transform;
+        if (gOrigAnimateWithDurationBlock) {
+            ((void (*)(id, SEL, NSTimeInterval, void (^)(void), void (^)(BOOL)))gOrigAnimateWithDurationBlock)(self, _cmd, duration, ^{
+                if (animations) animations();
+            }, completion);
+        }
+        CGRect afterFrame = panel.frame;
+        CGAffineTransform afterT = panel.transform;
+        if (!CGRectEqualToRect(beforeFrame, afterFrame) || !CGAffineTransformEqualToTransform(beforeT, afterT)) {
+            DYYYDUXTrace(@"⚠️ 影响面板的UIView动画 duration=%.3f (无delay版)", duration);
+        }
+        return;
+    }
+    if (gOrigAnimateWithDurationBlock) {
+        ((void (*)(id, SEL, NSTimeInterval, void (^)(void), void (^)(BOOL)))gOrigAnimateWithDurationBlock)(self, _cmd, duration, animations, completion);
+    }
+}
+
+// 弹簧动画：关闭窗口内拉长 duration + velocity 归零（dpp_panel_dismiss_velocity_duration 元凶候选）
+static void DYYYTraceSpringAnimate(id self, SEL _cmd, NSTimeInterval duration, NSTimeInterval delay, CGFloat damping, CGFloat velocity, UIViewAnimationOptions options, void (^animations)(void), void (^completion)(BOOL finished)) {
+    if (gDUXPanelClosing && duration > 0 && duration < 0.3) {
+        DYYYDUXTrace(@"⚠️[关闭中] 弹簧动画 duration=%.3f→0.35 damping=%.2f velocity=%.2f→0\n%@", duration, damping, velocity, [NSThread callStackSymbols]);
+        duration = 0.35;
+        velocity = 0;
+    }
+    if (gOrigSpringAnimate) {
+        ((void (*)(id, SEL, NSTimeInterval, NSTimeInterval, CGFloat, CGFloat, UIViewAnimationOptions, void (^)(void), void (^)(BOOL)))gOrigSpringAnimate)(self, _cmd, duration, delay, damping, velocity, options, animations, completion);
+    }
+}
+
+// 快照追踪：确认关闭动画是否在快照上执行
+static id DYYYTraceSnapshotAfterUpdates(id self, SEL _cmd, BOOL afterUpdates) {
+    id result = nil;
+    if (gOrigSnapshotAfterUpdates) {
+        result = ((id (*)(id, SEL, BOOL))gOrigSnapshotAfterUpdates)(self, _cmd, afterUpdates);
+    }
+    if ((gActiveDUXPanelView != nil || gDUXPanelClosing) && result) {
+        DYYYDUXTrace(@"snapshotViewAfterScreenUpdates by [%@] → %@\n%@", NSStringFromClass([self class]), NSStringFromClass([result class]), [NSThread callStackSymbols]);
+    }
+    return result;
+}
+
+static id DYYYTraceResizableSnapshot(id self, SEL _cmd, CGRect rect, BOOL afterUpdates, UIEdgeInsets capInsets) {
+    id result = nil;
+    if (gOrigResizableSnapshot) {
+        result = ((id (*)(id, SEL, CGRect, BOOL, UIEdgeInsets))gOrigResizableSnapshot)(self, _cmd, rect, afterUpdates, capInsets);
+    }
+    if ((gActiveDUXPanelView != nil || gDUXPanelClosing) && result) {
+        DYYYDUXTrace(@"resizableSnapshotViewFromRect by [%@] → %@\n%@", NSStringFromClass([self class]), NSStringFromClass([result class]), [NSThread callStackSymbols]);
+    }
+    return result;
+}
+
+// 全局 present/dismiss：锁定分享面板宿主类
+static void DYYYTracePresentAnimated(id self, SEL _cmd, UIViewController *vc, BOOL animated, void (^completion)(void)) {
+    DYYYDUXTrace(@"presentViewController: %@ animated=%d by %@\n%@", NSStringFromClass([vc class]), animated, NSStringFromClass([self class]), [NSThread callStackSymbols]);
+    if (gOrigVCPresentAnimated) {
+        ((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))gOrigVCPresentAnimated)(self, _cmd, vc, animated, completion);
+    }
+}
+
+static void DYYYTraceDismissAnimated(id self, SEL _cmd, BOOL animated, void (^completion)(void)) {
+    if (gActiveDUXPanelView != nil || gDUXPanelClosing) {
+        DYYYDUXTrace(@"dismissViewControllerAnimated by %@ presented=%@ animated=%d\n%@", NSStringFromClass([self class]), NSStringFromClass([[self presentedViewController] class]), animated, [NSThread callStackSymbols]);
+    }
+    if (gOrigVCDismissAnimated) {
+        ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigVCDismissAnimated)(self, _cmd, animated, completion);
+    }
+}
+
+// CATransaction 时长追踪（Core Animation 层）
+static void DYYYTraceCATransactionDuration(id self, SEL _cmd, CFTimeInterval duration) {
+    if (gDUXPanelClosing && duration > 0 && duration < 0.3) {
+        DYYYDUXTrace(@"⚠️[关闭中] CATransaction setAnimationDuration %.3f\n%@", duration, [NSThread callStackSymbols]);
+    }
+    if (gOrigCATransactionDuration) {
+        ((void (*)(id, SEL, CFTimeInterval))gOrigCATransactionDuration)(self, _cmd, duration);
+    }
+}
+
+// UIViewPropertyAnimator 追踪
+static id DYYYTraceAnimatorInitDuration(id self, SEL _cmd, NSTimeInterval duration, id timingParameters) {
+    id result = nil;
+    if (gOrigAnimatorInitDuration) {
+        result = ((id (*)(id, SEL, NSTimeInterval, id))gOrigAnimatorInitDuration)(self, _cmd, duration, timingParameters);
+    }
+    if (gDUXPanelClosing) {
+        DYYYDUXTrace(@"UIViewPropertyAnimator init(duration=%.3f) → %@\n%@", duration, NSStringFromClass([result class]), [NSThread callStackSymbols]);
+    }
+    return result;
+}
+
+static id DYYYTraceAnimatorInitCurve(id self, SEL _cmd, NSTimeInterval duration, NSInteger curve, void (^animations)(void)) {
+    id result = nil;
+    if (gOrigAnimatorInitCurve) {
+        result = ((id (*)(id, SEL, NSTimeInterval, NSInteger, void (^)(void)))gOrigAnimatorInitCurve)(self, _cmd, duration, curve, animations);
+    }
+    if (gDUXPanelClosing) {
+        DYYYDUXTrace(@"UIViewPropertyAnimator init(curve) duration=%.3f\n%@", duration, [NSThread callStackSymbols]);
+    }
+    return result;
+}
+
+static void DYYYInstallDUXAncestorHooks(void) {
+    Class uiview = [UIView class];
+    Method m = class_getInstanceMethod(uiview, @selector(setTransform:));
+    if (m) {
+        gOrigUIViewSetTransform = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceContainerSetTransform);
+    }
+    m = class_getInstanceMethod(uiview, @selector(setCenter:));
+    if (m) {
+        gOrigUIViewSetCenter = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceContainerSetCenter);
+    }
+    // 类方法：+animateWithDuration:delay:options:animations:completion:
+    m = class_getClassMethod(uiview, @selector(animateWithDuration:delay:options:animations:completion:));
+    if (m) {
+        gOrigAnimateWithDurationOptions = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceAnimateWithDurationOptions);
+    }
+    m = class_getClassMethod(uiview, @selector(animateWithDuration:animations:completion:));
+    if (m) {
+        gOrigAnimateWithDurationBlock = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceAnimateWithDurationBlock);
+    }
+    // 弹簧动画（velocity 元凶候选）
+    m = class_getClassMethod(uiview, @selector(animateWithDuration:delay:usingSpringWithDamping:initialSpringVelocity:options:animations:completion:));
+    if (m) {
+        gOrigSpringAnimate = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceSpringAnimate);
+    }
+    // 快照（关闭动画执行层候选）
+    m = class_getInstanceMethod(uiview, @selector(snapshotViewAfterScreenUpdates:));
+    if (m) {
+        gOrigSnapshotAfterUpdates = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceSnapshotAfterUpdates);
+    }
+    m = class_getInstanceMethod(uiview, @selector(resizableSnapshotViewFromRect:afterScreenUpdates:withCapInsets:));
+    if (m) {
+        gOrigResizableSnapshot = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceResizableSnapshot);
+    }
+    // 全局 present/dismiss（锁定分享面板宿主类）
+    m = class_getInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:));
+    if (m) {
+        gOrigVCPresentAnimated = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTracePresentAnimated);
+    }
+    m = class_getInstanceMethod([UIViewController class], @selector(dismissViewControllerAnimated:completion:));
+    if (m) {
+        gOrigVCDismissAnimated = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceDismissAnimated);
+    }
+    // CATransaction 动画时长（Core Animation 层）
+    m = class_getClassMethod([CATransaction class], @selector(setAnimationDuration:));
+    if (m) {
+        gOrigCATransactionDuration = method_getImplementation(m);
+        method_setImplementation(m, (IMP)DYYYTraceCATransactionDuration);
+    }
+    // UIViewPropertyAnimator（iOS10+ 转场动画）
+    Class animatorClass = NSClassFromString(@"UIViewPropertyAnimator");
+    if (animatorClass) {
+        m = class_getInstanceMethod(animatorClass, @selector(initWithDuration:timingParameters:));
+        if (m) {
+            gOrigAnimatorInitDuration = method_getImplementation(m);
+            method_setImplementation(m, (IMP)DYYYTraceAnimatorInitDuration);
+        }
+        m = class_getInstanceMethod(animatorClass, @selector(initWithDuration:curve:animations:));
+        if (m) {
+            gOrigAnimatorInitCurve = method_getImplementation(m);
+            method_setImplementation(m, (IMP)DYYYTraceAnimatorInitCurve);
         }
     }
 }
 
-// 接管 DUXSheetNavigationController dismiss：面板存在时先 0.35s 慢速下滑 + 遮罩淡出，再无动画 dismiss
+// ============ DUXSheetNavigationController 关闭接管（build.12 确定性修复） ============
+// 轨迹实锤：分享面板宿主 = DUXSheetNavigationController，dismiss 后 176ms 即 win=nil（官方快速转场）
+// 方案：接管 dismiss，面板 0.35s 慢速滑出底部 + 遮罩淡出 → 再无动画 dismiss
+static IMP gOrigDUXSheetDismiss = NULL;
+
 static void DYYYFixDUXSheetDismiss(id self, SEL _cmd, BOOL animated, void (^completion)(void)) {
     UIView *panel = gActiveDUXPanelView;
     if (animated && panel && panel.window) {
+        DYYYDUXTrace(@"🔧 接管 DUXSheetNavigationController dismiss（自定义 0.35s 慢速下滑关闭）");
         UIView *dismissMask = nil;
         for (UIView *sub in panel.superview.subviews) {
             if ([NSStringFromClass([sub class]) isEqualToString:@"DUXAccessibilityDismissView"]) {
@@ -12117,43 +12500,39 @@ static void DYYYFixDUXSheetDismiss(id self, SEL _cmd, BOOL animated, void (^comp
                 dismissMask.alpha = 0.0;
             }
         } completion:^(BOOL finished) {
-            if (gOrigDUXDismissAnimated) {
-                ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigDUXDismissAnimated)(self, _cmd, NO, completion);
+            if (gOrigDUXSheetDismiss) {
+                ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigDUXSheetDismiss)(self, _cmd, NO, completion);
             } else if (completion) {
                 completion();
             }
         }];
     } else {
-        if (gOrigDUXDismissAnimated) {
-            ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigDUXDismissAnimated)(self, _cmd, animated, completion);
+        DYYYDUXTrace(@"DUXSheetNavigationController dismiss animated=%d panel=%@", animated, panel ? @"YES" : @"nil");
+        if (gOrigDUXSheetDismiss) {
+            ((void (*)(id, SEL, BOOL, void (^)(void)))gOrigDUXSheetDismiss)(self, _cmd, animated, completion);
         }
     }
 }
 
-static void DYYYInstallDUXSheetFix(void) {
-    // 跟踪面板 window 状态（维护 gActiveDUXPanelView）
-    Class duxClass = objc_getClass("DUXVisualEffectView");
-    if (duxClass) {
-        Method m = class_getInstanceMethod(duxClass, @selector(didMoveToWindow));
-        if (m) {
-            gOrigDUXDidMoveToWindow = method_getImplementation(m);
-            method_setImplementation(m, (IMP)DYYYTrackDUXPanelWindow);
-        }
-    }
-    // 接管 DUXSheetNavigationController dismiss
+static void DYYYInstallDUXSheetDismissFix(void) {
     Class sheetNavClass = objc_getClass("DUXSheetNavigationController");
-    if (sheetNavClass) {
-        SEL dismissSel = @selector(dismissViewControllerAnimated:completion:);
-        Method m = class_getInstanceMethod(sheetNavClass, dismissSel);
-        if (m) {
-            gOrigDUXDismissAnimated = method_getImplementation(m);
-            if (!class_addMethod(sheetNavClass, dismissSel, (IMP)DYYYFixDUXSheetDismiss, "v@:B@?")) {
-                method_setImplementation(m, (IMP)DYYYFixDUXSheetDismiss);
-            }
-        }
+    if (!sheetNavClass) {
+        return;
     }
+    SEL dismissSel = @selector(dismissViewControllerAnimated:completion:);
+    Method m = class_getInstanceMethod(sheetNavClass, dismissSel);
+    if (!m) {
+        return;
+    }
+    gOrigDUXSheetDismiss = method_getImplementation(m);
+    if (!class_addMethod(sheetNavClass, dismissSel, (IMP)DYYYFixDUXSheetDismiss, "v@:B@?")) {
+        method_setImplementation(m, (IMP)DYYYFixDUXSheetDismiss);
+    }
+    DYYYDUXTrace(@"DUXSheetNavigationController dismiss 接管已安装");
 }
 
 %ctor {
-    DYYYInstallDUXSheetFix();
+    DYYYInstallDUXTraceHooks();
+    DYYYInstallDUXAncestorHooks();
+    DYYYInstallDUXSheetDismissFix();
 }
