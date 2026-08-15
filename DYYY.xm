@@ -10701,6 +10701,17 @@ static Class tabBarButtonClass = nil;
         CGRect frame = self.frame;
         frame.size.height = self.superview.frame.size.height;
         self.frame = frame;
+    } else if (gCurrentTabBarHeight > 0) {
+        // 39.x 官方分享面板高度实验下，feed 容器高度偏移会导致分享面板关闭动画错乱
+        // （面板从顶部快速滑落消失）。恢复非全屏时的高度修正以补偿官方布局偏移。
+        UIWindow *keyWindow = [DYYYUtils getActiveWindow];
+        if (keyWindow && keyWindow.safeAreaInsets.bottom == 0) {
+            return;
+        }
+
+        CGRect frame = self.frame;
+        frame.size.height = self.superview.frame.size.height - gCurrentTabBarHeight;
+        self.frame = frame;
     }
 }
 %end
