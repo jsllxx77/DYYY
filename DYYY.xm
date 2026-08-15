@@ -12102,44 +12102,70 @@ static void DYYYDUXTrace(NSString *format, ...) {
     }
 }
 
-%hook DUXVisualEffectView
+static BOOL DYYYIsDUXVisualEffectView(UIView *view) {
+    return [NSStringFromClass([view class]) isEqualToString:@"DUXVisualEffectView"];
+}
+
+%hook UIVisualEffectView
 - (void)setFrame:(CGRect)frame {
-    DYYYDUXTrace(@"DUXVisualEffectView setFrame %@ (prev %@)", NSStringFromCGRect(frame), NSStringFromCGRect(self.frame));
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setFrame %@ (prev %@)", NSStringFromCGRect(frame), NSStringFromCGRect(self.frame));
+    }
     %orig;
 }
 - (void)setCenter:(CGPoint)center {
-    DYYYDUXTrace(@"DUXVisualEffectView setCenter %@ (prev %@)", NSStringFromCGPoint(center), NSStringFromCGPoint(self.center));
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setCenter %@ (prev %@)", NSStringFromCGPoint(center), NSStringFromCGPoint(self.center));
+    }
     %orig;
 }
 - (void)setTransform:(CGAffineTransform)transform {
-    DYYYDUXTrace(@"DUXVisualEffectView setTransform %@", NSStringFromCGAffineTransform(transform));
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setTransform %@", NSStringFromCGAffineTransform(transform));
+    }
     %orig;
 }
 - (void)setAlpha:(CGFloat)alpha {
-    DYYYDUXTrace(@"DUXVisualEffectView setAlpha %.3f (prev %.3f)", alpha, self.alpha);
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView setAlpha %.3f (prev %.3f)", alpha, self.alpha);
+    }
     %orig;
 }
 - (void)didMoveToWindow {
-    DYYYDUXTrace(@"DUXVisualEffectView didMoveToWindow win=%@ frame=%@", self.window ? @"YES" : @"nil", NSStringFromCGRect(self.frame));
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView didMoveToWindow win=%@ frame=%@", self.window ? @"YES" : @"nil", NSStringFromCGRect(self.frame));
+    }
     %orig;
 }
 - (void)willMoveToWindow:(UIWindow *)newWindow {
-    DYYYDUXTrace(@"DUXVisualEffectView willMoveToWindow %@ frame=%@", newWindow ? @"new" : @"nil", NSStringFromCGRect(self.frame));
+    if (DYYYIsDUXVisualEffectView(self)) {
+        DYYYDUXTrace(@"DUXVisualEffectView willMoveToWindow %@ frame=%@", newWindow ? @"new" : @"nil", NSStringFromCGRect(self.frame));
+    }
     %orig;
 }
 %end
 
-%hook DUXContentSheet
+static BOOL DYYYIsDUXContentSheet(UIViewController *vc) {
+    return [NSStringFromClass([vc class]) isEqualToString:@"DUXContentSheet"];
+}
+
+%hook UIViewController
 - (void)viewWillDisappear:(BOOL)animated {
-    DYYYDUXTrace(@"DUXContentSheet viewWillDisappear animated=%d frame=%@", animated, NSStringFromCGRect(self.view.frame));
+    if (DYYYIsDUXContentSheet(self)) {
+        DYYYDUXTrace(@"DUXContentSheet viewWillDisappear animated=%d frame=%@", animated, NSStringFromCGRect(self.view.frame));
+    }
     %orig(animated);
 }
 - (void)viewDidDisappear:(BOOL)animated {
-    DYYYDUXTrace(@"DUXContentSheet viewDidDisappear animated=%d", animated);
+    if (DYYYIsDUXContentSheet(self)) {
+        DYYYDUXTrace(@"DUXContentSheet viewDidDisappear animated=%d", animated);
+    }
     %orig(animated);
 }
 - (void)dismissViewControllerAnimated:(BOOL)animated completion:(void (^)(void))completion {
-    DYYYDUXTrace(@"DUXContentSheet dismissViewControllerAnimated animated=%d\n%@", animated, [NSThread callStackSymbols]);
+    if (DYYYIsDUXContentSheet(self)) {
+        DYYYDUXTrace(@"DUXContentSheet dismissViewControllerAnimated animated=%d\n%@", animated, [NSThread callStackSymbols]);
+    }
     %orig(animated, completion);
 }
 %end
