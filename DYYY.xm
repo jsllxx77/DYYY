@@ -3095,7 +3095,8 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
             %orig(1.0);
         }
     } else {
-        %orig(1.0);
+        // 未配置透明度时透传原值，避免吞掉抖音自身的顶栏动画（如分享面板弹出时的淡出）
+        %orig(alpha);
     }
 }
 %end

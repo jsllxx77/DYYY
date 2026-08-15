@@ -19,6 +19,7 @@
 #import "DYYYFloatSpeedButton.h"
 #import "DYYYSettingsHelper.h"
 #import "DYYYUtils.h"
+#import "AWMSafeDispatchTimer.h"
 
 @class DYYYIconOptionsDialogView;
 static void showIconOptionsDialog(NSString *title, UIImage *previewImage, NSString *saveFilename, void (^onClear)(void), void (^onSelect)(void));
@@ -40,6 +41,43 @@ static char kDYYYWeatherSubviewGestureInstalledKey;
 static char kDYYYSettingsSearchCoordinatorKey;
 static BOOL DYYYBuildingSettingsSearchIndex = NO;
 static BOOL DYYYSettingsSearchIndexBuilt = NO;
+
+// 视图树诊断模式：定时 dump 全部 window 视图树，用于定位分享面板等未知视图
+static AWMSafeDispatchTimer *gViewTreeDumpTimer = nil;
+
+static void DYYYSetViewTreeDumpMode(BOOL enabled) {
+    if (enabled) {
+        if (!gViewTreeDumpTimer) {
+            gViewTreeDumpTimer = [[AWMSafeDispatchTimer alloc] init];
+        }
+        if (!gViewTreeDumpTimer.isRunning) {
+            __weak AWMSafeDispatchTimer *weakTimer = gViewTreeDumpTimer;
+            [gViewTreeDumpTimer startWithInterval:2.0
+                                          leeway:0.5
+                                           queue:dispatch_get_main_queue()
+                                         repeats:YES
+                                         handler:^{
+                AWMSafeDispatchTimer *strongTimer = weakTimer;
+                if (!strongTimer) {
+                    return;
+                }
+                NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+                NSString *documentsDirectory = paths.firstObject;
+                NSString *dyyyFolderPath = [documentsDirectory stringByAppendingPathComponent:@"DYYY"];
+                NSFileManager *fileManager = [NSFileManager defaultManager];
+                if (![fileManager fileExistsAtPath:dyyyFolderPath]) {
+                    [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:nil];
+                }
+                NSString *dumpPath = [dyyyFolderPath stringByAppendingPathComponent:@"view_tree_diag.txt"];
+                [DYYYUtils dumpAllWindowsViewTreeToFile:dumpPath];
+            }];
+        }
+    } else {
+        [gViewTreeDumpTimer cancel];
+        gViewTreeDumpTimer = nil;
+    }
+}
+
 static NSString *const kDYYYFeedNowPlayingSettingTitle = @"屏蔽灵动岛抖音播放信息";
 static NSString *const kDYYYFeedNowPlayingSettingIdentifier = @"DYYYDisableFeedNowPlayingInfo";
 static NSString *const kDYYYFeedNowPlayingSVGIconName = @"ic_liveactivityplayslash_outlined_20";
@@ -2804,7 +2842,17 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
             @"title" : @"删除本地配置",
             @"detail" : @"",
             @"cellType" : @26,
-            @"imageName" : @"ic_trash_outlined_20"}
+            @"imageName" : @"ic_trash_outlined_20"},
+          @{@"identifier" : @"DYYYViewTreeDumpMode",
+            @"title" : @"视图树诊断模式",
+            @"detail" : @"开启后每2秒抓取全部窗口视图树",
+            @"cellType" : @6,
+            @"imageName" : @"ic_memorycard_outlined_20"},
+          @{@"identifier" : @"DYYYExportViewTreeDump",
+            @"title" : @"导出视图树文件",
+            @"detail" : @"立即抓取并导出到文件",
+            @"cellType" : @26,
+            @"imageName" : @"ic_phonearrowup_outlined_20"}
       ];
 
       // --- 声明一个__block变量来持有SaveABTestConfigFileitem ---
@@ -3306,6 +3354,40 @@ void showDYYYSettingsVC(UIViewController *rootVC, BOOL hasAgreed) {
                 } else {
                     [DYYYUtils showToast:@"本地配置不存在"];
                 }
+              };
+          } else if ([item.identifier isEqualToString:@"DYYYViewTreeDumpMode"]) {
+              item.switchChangedBlock = ^{
+                BOOL newValue = !item.isSwitchOn;
+                item.isSwitchOn = newValue;
+                [DYYYSettingsHelper setUserDefaults:@(newValue) forKey:@"DYYYViewTreeDumpMode"];
+                DYYYSetViewTreeDumpMode(newValue);
+                [DYYYUtils showToast:newValue ? @"视图树诊断已开启（每2秒抓取）" : @"视图树诊断已关闭"];
+              };
+          } else if ([item.identifier isEqualToString:@"DYYYExportViewTreeDump"]) {
+              item.cellTappedBlock = ^{
+                if (!item.isEnable)
+                    return;
+                NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+                [formatter setDateFormat:@"yyyyMMdd_HHmmss"];
+                NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+                NSString *tempFilePath = [DYYYUtils cachePathForFilename:[NSString stringWithFormat:@"view_tree_%@.txt", timestamp]];
+                [DYYYUtils dumpAllWindowsViewTreeToFile:tempFilePath];
+                [DYYYUtils showToast:@"正在抓取视图树..."];
+                // dump 为异步写盘，稍等再弹导出面板
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                  NSURL *tempFileURL = [NSURL fileURLWithPath:tempFilePath];
+                  UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc] initWithURLs:@[ tempFileURL ] inMode:UIDocumentPickerModeExportToService];
+                  DYYYBackupPickerDelegate *pickerDelegate = [[DYYYBackupPickerDelegate alloc] init];
+                  pickerDelegate.tempFilePath = tempFilePath;
+                  pickerDelegate.completionBlock = ^(NSURL *url) {
+                    [DYYYUtils showToast:@"视图树已导出"];
+                  };
+                  static char kDumpPickerDelegateKey;
+                  documentPicker.delegate = pickerDelegate;
+                  objc_setAssociatedObject(documentPicker, &kDumpPickerDelegateKey, pickerDelegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                  UIViewController *topVC = topView();
+                  [topVC presentViewController:documentPicker animated:YES completion:nil];
+                });
               };
           }
 
