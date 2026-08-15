@@ -12068,3 +12068,78 @@ static void findTargetViewInView(UIView *view) {
                                                     }];
     }
 }
+
+// ============ DUX 分享面板动画轨迹诊断（分享面板关闭动画排查） ============
+// 视图树已确认分享面板 = DUXVisualEffectView + DUXContentSheet 容器（原生 UIKit，非 Compose）
+// 记录面板关闭动画的 frame/transform/alpha 轨迹到 Documents/DYYY/DUXPanelTrace.txt
+static NSString *DYYYDUXTraceFilePath(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *documentsDirectory = paths.firstObject;
+    NSString *dyyyFolderPath = [documentsDirectory stringByAppendingPathComponent:@"DYYY"];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    if (![fileManager fileExistsAtPath:dyyyFolderPath]) {
+        [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    return [dyyyFolderPath stringByAppendingPathComponent:@"DUXPanelTrace.txt"];
+}
+
+static void DYYYDUXTrace(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"HH:mm:ss.SSS"];
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [formatter stringFromDate:[NSDate date]], message];
+    NSString *filePath = DYYYDUXTraceFilePath();
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:filePath];
+    if (!fileHandle) {
+        [line writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    }
+}
+
+%hook DUXVisualEffectView
+- (void)setFrame:(CGRect)frame {
+    DYYYDUXTrace(@"DUXVisualEffectView setFrame %@ (prev %@)", NSStringFromCGRect(frame), NSStringFromCGRect(self.frame));
+    %orig;
+}
+- (void)setCenter:(CGPoint)center {
+    DYYYDUXTrace(@"DUXVisualEffectView setCenter %@ (prev %@)", NSStringFromCGPoint(center), NSStringFromCGPoint(self.center));
+    %orig;
+}
+- (void)setTransform:(CGAffineTransform)transform {
+    DYYYDUXTrace(@"DUXVisualEffectView setTransform %@", NSStringFromCGAffineTransform(transform));
+    %orig;
+}
+- (void)setAlpha:(CGFloat)alpha {
+    DYYYDUXTrace(@"DUXVisualEffectView setAlpha %.3f (prev %.3f)", alpha, self.alpha);
+    %orig;
+}
+- (void)didMoveToWindow {
+    DYYYDUXTrace(@"DUXVisualEffectView didMoveToWindow win=%@ frame=%@", self.window ? @"YES" : @"nil", NSStringFromCGRect(self.frame));
+    %orig;
+}
+- (void)willMoveToWindow:(UIWindow *)newWindow {
+    DYYYDUXTrace(@"DUXVisualEffectView willMoveToWindow %@ frame=%@", newWindow ? @"new" : @"nil", NSStringFromCGRect(self.frame));
+    %orig;
+}
+%end
+
+%hook DUXContentSheet
+- (void)viewWillDisappear:(BOOL)animated {
+    DYYYDUXTrace(@"DUXContentSheet viewWillDisappear animated=%d frame=%@", animated, NSStringFromCGRect(self.view.frame));
+    %orig(animated);
+}
+- (void)viewDidDisappear:(BOOL)animated {
+    DYYYDUXTrace(@"DUXContentSheet viewDidDisappear animated=%d", animated);
+    %orig(animated);
+}
+- (void)dismissViewControllerAnimated:(BOOL)animated completion:(void (^)(void))completion {
+    DYYYDUXTrace(@"DUXContentSheet dismissViewControllerAnimated animated=%d\n%@", animated, [NSThread callStackSymbols]);
+    %orig(animated, completion);
+}
+%end
