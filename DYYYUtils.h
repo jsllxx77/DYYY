@@ -286,6 +286,9 @@ NS_ASSUME_NONNULL_BEGIN
  */
 + (NSComparisonResult)compareVersion:(NSString *)lhs toVersion:(NSString *)rhs;
 
+/** 追加实况下载诊断日志（Documents/DYYY/LivePhotoDiag.txt，500KB 轮转） */
++ (void)appendDiagLog:(NSString *)log;
+
 @end
 
 #pragma mark - External C Functions (外部 C 函数)
@@ -321,8 +324,5 @@ id DYYYJSONSafeObject(id _Nullable obj);
 #ifdef __cplusplus
 }
 #endif
-
-/** 追加实况下载诊断日志（Documents/DYYY/LivePhotoDiag.txt，500KB 轮转） */
-+ (void)appendDiagLog:(NSString *_Nonnull)log;
 
 NS_ASSUME_NONNULL_END
