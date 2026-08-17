@@ -395,6 +395,15 @@
         BOOL imageExists = [[NSFileManager defaultManager] fileExistsAtPath:imagePath];
         BOOL videoExists = [[NSFileManager defaultManager] fileExistsAtPath:videoPath];
 
+        // 实况下载结果诊断（build.16）
+        [DYYYUtils appendDiagLog:[NSString stringWithFormat:@"downloadLivePhoto result: image=%@(%@) video=%@(%@) imageSize=%lld videoSize=%lld",
+                                                            imageExists ? @"OK" : @"FAIL",
+                                                            imageURL ? imageURL.absoluteString : @"(nil)",
+                                                            videoExists ? @"OK" : @"FAIL",
+                                                            videoURL ? videoURL.absoluteString : @"(nil)",
+                                                            imageExists ? [[[NSFileManager defaultManager] attributesOfItemAtPath:imagePath error:nil][NSFileSize] longLongValue] : -1,
+                                                            videoExists ? [[[NSFileManager defaultManager] attributesOfItemAtPath:videoPath error:nil][NSFileSize] longLongValue] : -1]];
+
         BOOL downloadSucceeded = imageExists && videoExists;
         progressView.allowSuccessAnimation = downloadSucceeded;
         [progressView dismiss];
@@ -406,6 +415,7 @@
                     [[DYYYManager shared] saveLivePhoto:imagePath videoUrl:videoPath];
                 }
             } @catch (NSException *exception) {
+                [DYYYUtils appendDiagLog:[NSString stringWithFormat:@"saveLivePhoto exception: %@\n%@", exception, exception.callStackSymbols]];
                 // 删除失败的文件
                 [[NSFileManager defaultManager] removeItemAtPath:imagePath error:nil];
                 [[NSFileManager defaultManager] removeItemAtPath:videoPath error:nil];
@@ -413,6 +423,7 @@
                 [DYYYUtils showToast:@"保存实况照片失败"];
             }
         } else {
+            [DYYYUtils appendDiagLog:@"download failed -> 清理不完整文件"];
             // 清理不完整的文件
             if (imageExists)
                 [[NSFileManager defaultManager] removeItemAtPath:imagePath error:nil];
@@ -1167,6 +1178,8 @@
                                     [[NSFileManager defaultManager] removeItemAtPath:videoSourcePath error:nil];
                                     [[NSFileManager defaultManager] removeItemAtPath:photoFile error:nil];
                                     [[NSFileManager defaultManager] removeItemAtPath:videoFile error:nil];
+                                } else {
+                                    [DYYYUtils appendDiagLog:[NSString stringWithFormat:@"PHAssetCreationRequest FAILED: %@\nphoto=%@\nvideo=%@", error ? error.localizedDescription : @"(nil)", photo, video]];
                                 }
                               });
                             }];

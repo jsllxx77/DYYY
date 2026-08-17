@@ -900,6 +900,35 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
     }
 }
 
++ (void)appendDiagLog:(NSString *)log {
+    if (log.length == 0) {
+        return;
+    }
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *documentsDirectory = paths.firstObject;
+    NSString *dyyyFolderPath = [documentsDirectory stringByAppendingPathComponent:@"DYYY"];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    if (![fileManager fileExistsAtPath:dyyyFolderPath]) {
+        [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    NSString *filePath = [dyyyFolderPath stringByAppendingPathComponent:@"LivePhotoDiag.txt"];
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss.SSS"];
+    NSString *line = [NSString stringWithFormat:@"\n===== %@ =====\n%@\n", [formatter stringFromDate:[NSDate date]], log];
+    NSDictionary *attrs = [fileManager attributesOfItemAtPath:filePath error:nil];
+    if (attrs && [attrs[NSFileSize] longLongValue] > 500 * 1024) {
+        [fileManager removeItemAtPath:filePath error:nil];
+    }
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:filePath];
+    if (!fileHandle) {
+        [line writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    }
+}
+
 + (BOOL)isDarkMode {
     Class themeManagerClass = NSClassFromString(@"AWEUIThemeManager");
     if (!themeManagerClass) {

@@ -228,7 +228,18 @@
           } else {
               currentImageModel = awemeModel.albumImages.firstObject;
           }
-          // 如果是实况的话
+          // 实况下载诊断：记录模型状态与 URL 选取过程（build.16）
+          NSMutableString *diag = [NSMutableString string];
+          [diag appendFormat:@"awemeType=%ld count=%ld idx=%ld isLivePhoto=%d clipVideo=%@\n", (long)awemeModel.awemeType, (long)awemeModel.albumImages.count, (long)awemeModel.currentImageIndex, awemeModel.isLivePhoto ? 1 : 0, currentImageModel.clipVideo ? @"YES" : @"nil"];
+          for (NSString *u in currentImageModel.urlList) {
+              [diag appendFormat:@"urlList: %@\n", u];
+          }
+          if (currentImageModel.clipVideo) {
+              [diag appendFormat:@"clipVideo.playURL=%@\n", currentImageModel.clipVideo.playURL];
+              for (NSString *u in currentImageModel.clipVideo.playURL.originURLList) {
+                  [diag appendFormat:@"playURL.origin: %@\n", u];
+              }
+          }
           // 查找非.image后缀的URL
           NSURL *downloadURL = nil;
           for (NSString *urlString in currentImageModel.urlList) {
@@ -239,14 +250,18 @@
                   break;
               }
           }
+          [diag appendFormat:@"selected downloadURL=%@\n", downloadURL ? downloadURL.absoluteString : @"(nil)"];
 
           if (currentImageModel.clipVideo != nil) {
               NSURL *videoURL = [currentImageModel.clipVideo.playURL getDYYYSrcURLDownload];
+              [diag appendFormat:@"selected videoURL=%@\n", videoURL ? videoURL.absoluteString : @"(nil)"];
+              [DYYYUtils appendDiagLog:diag];
               [DYYYManager downloadLivePhoto:downloadURL
                                     videoURL:videoURL
                                   completion:^{
                                   }];
           } else if (currentImageModel && currentImageModel.urlList.count > 0) {
+              [DYYYUtils appendDiagLog:diag];
               if (downloadURL) {
                   [DYYYManager downloadMedia:downloadURL
                                    mediaType:MediaTypeImage
@@ -998,7 +1013,18 @@
           } else {
               currentImageModel = awemeModel.albumImages.firstObject;
           }
-          // 如果是实况的话
+          // 实况下载诊断：记录模型状态与 URL 选取过程（build.16）
+          NSMutableString *diag = [NSMutableString string];
+          [diag appendFormat:@"awemeType=%ld count=%ld idx=%ld isLivePhoto=%d clipVideo=%@\n", (long)awemeModel.awemeType, (long)awemeModel.albumImages.count, (long)awemeModel.currentImageIndex, awemeModel.isLivePhoto ? 1 : 0, currentImageModel.clipVideo ? @"YES" : @"nil"];
+          for (NSString *u in currentImageModel.urlList) {
+              [diag appendFormat:@"urlList: %@\n", u];
+          }
+          if (currentImageModel.clipVideo) {
+              [diag appendFormat:@"clipVideo.playURL=%@\n", currentImageModel.clipVideo.playURL];
+              for (NSString *u in currentImageModel.clipVideo.playURL.originURLList) {
+                  [diag appendFormat:@"playURL.origin: %@\n", u];
+              }
+          }
           // 查找非.image后缀的URL
           NSURL *downloadURL = nil;
           for (NSString *urlString in currentImageModel.urlList) {
@@ -1009,14 +1035,18 @@
                   break;
               }
           }
+          [diag appendFormat:@"selected downloadURL=%@\n", downloadURL ? downloadURL.absoluteString : @"(nil)"];
 
           if (currentImageModel.clipVideo != nil) {
               NSURL *videoURL = [currentImageModel.clipVideo.playURL getDYYYSrcURLDownload];
+              [diag appendFormat:@"selected videoURL=%@\n", videoURL ? videoURL.absoluteString : @"(nil)"];
+              [DYYYUtils appendDiagLog:diag];
               [DYYYManager downloadLivePhoto:downloadURL
                                     videoURL:videoURL
                                   completion:^{
                                   }];
           } else if (currentImageModel && currentImageModel.urlList.count > 0) {
+              [DYYYUtils appendDiagLog:diag];
               if (downloadURL) {
                   [DYYYManager downloadMedia:downloadURL
                                    mediaType:MediaTypeImage

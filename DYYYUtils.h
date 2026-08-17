@@ -322,4 +322,7 @@ id DYYYJSONSafeObject(id _Nullable obj);
 }
 #endif
 
+/** 追加实况下载诊断日志（Documents/DYYY/LivePhotoDiag.txt，500KB 轮转） */
++ (void)appendDiagLog:(NSString *_Nonnull)log;
+
 NS_ASSUME_NONNULL_END
