@@ -9271,8 +9271,15 @@ static NSHashTable *processedParentViews = nil;
                                                                                                         imgName:nil
                                                                                                         handler:^{
                                                                                                           if (musicModel && musicModel.playURL && musicModel.playURL.originURLList.count > 0) {
-                                                                                                              NSURL *url = [NSURL URLWithString:musicModel.playURL.originURLList.firstObject];
-                                                                                                              [DYYYManager downloadMedia:url mediaType:MediaTypeAudio audio:nil completion:nil];
+                                                                                                              // 收集全部候选 URL，首个 CDN 失败自动切换
+                                                                                                              NSMutableArray<NSURL *> *audioURLs = [NSMutableArray array];
+                                                                                                              for (NSString *urlString in musicModel.playURL.originURLList) {
+                                                                                                                  NSURL *url = [NSURL URLWithString:urlString];
+                                                                                                                  if (url) {
+                                                                                                                      [audioURLs addObject:url];
+                                                                                                                  }
+                                                                                                              }
+                                                                                                              [DYYYManager downloadMediaFromURLs:audioURLs mediaType:MediaTypeAudio audio:nil completion:nil];
                                                                                                           }
                                                                                                         }];
             [actions addObject:downloadAudioAction];
