@@ -144,13 +144,33 @@
               audioURL = [NSURL URLWithString:musicModel.playURL.originURLList.firstObject];
           }
 
+                  // 收集全部候选 URL（h264 优先，playURL 兜底），首个 CDN 失败自动切换
+                  NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
                   if (videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-                      NSURL *url = [NSURL URLWithString:videoModel.h264URL.originURLList.firstObject];
-                      [DYYYManager downloadMedia:url
-                                       mediaType:MediaTypeVideo
-                                           audio:audioURL
-                                      completion:^(BOOL success){
-                                      }];
+                      for (NSString *urlString in videoModel.h264URL.originURLList) {
+                          NSURL *url = [NSURL URLWithString:urlString];
+                          if (url) {
+                              [videoURLs addObject:url];
+                          }
+                      }
+                  }
+                  if (videoModel.playURL && videoModel.playURL.originURLList.count > 0) {
+                      for (NSString *urlString in videoModel.playURL.originURLList) {
+                          NSURL *url = [NSURL URLWithString:urlString];
+                          if (url && ![videoURLs containsObject:url]) {
+                              [videoURLs addObject:url];
+                          }
+                      }
+                  }
+
+                  if (videoURLs.count > 0) {
+                      [DYYYManager downloadMediaFromURLs:videoURLs
+                                               mediaType:MediaTypeVideo
+                                                   audio:audioURL
+                                              completion:^(BOOL success){
+                                              }];
+                  } else {
+                      [DYYYUtils showToast:@"没有找到可用的视频地址"];
                   }
               
           
@@ -369,16 +389,23 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEVideoModel *videoModel = awemeModel.video;
           if (videoModel && videoModel.coverURL && videoModel.coverURL.originURLList.count > 0) {
-              NSURL *url = [NSURL URLWithString:videoModel.coverURL.originURLList.firstObject];
-              [DYYYManager downloadMedia:url
-                               mediaType:MediaTypeImage
-                                   audio:nil
-                              completion:^(BOOL success) {
-                                if (success) {
-                                } else {
-                                    [DYYYUtils showToast:@"封面保存已取消"];
-                                }
-                              }];
+              // 收集全部候选 URL，首个 CDN 失败自动切换
+              NSMutableArray<NSURL *> *coverURLs = [NSMutableArray array];
+              for (NSString *urlString in videoModel.coverURL.originURLList) {
+                  NSURL *url = [NSURL URLWithString:urlString];
+                  if (url) {
+                      [coverURLs addObject:url];
+                  }
+              }
+              [DYYYManager downloadMediaFromURLs:coverURLs
+                                       mediaType:MediaTypeImage
+                                           audio:nil
+                                      completion:^(BOOL success) {
+                                        if (success) {
+                                        } else {
+                                            [DYYYUtils showToast:@"封面保存已取消"];
+                                        }
+                                      }];
           }
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:nil];
@@ -397,8 +424,15 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEMusicModel *musicModel = awemeModel.music;
           if (musicModel && musicModel.playURL && musicModel.playURL.originURLList.count > 0) {
-              NSURL *url = [NSURL URLWithString:musicModel.playURL.originURLList.firstObject];
-              [DYYYManager downloadMedia:url mediaType:MediaTypeAudio audio:nil completion:nil];
+              // 收集全部候选 URL，首个 CDN 失败自动切换
+              NSMutableArray<NSURL *> *audioURLs = [NSMutableArray array];
+              for (NSString *urlString in musicModel.playURL.originURLList) {
+                  NSURL *url = [NSURL URLWithString:urlString];
+                  if (url) {
+                      [audioURLs addObject:url];
+                  }
+              }
+              [DYYYManager downloadMediaFromURLs:audioURLs mediaType:MediaTypeAudio audio:nil completion:nil];
           }
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:nil];
@@ -913,13 +947,33 @@
           }
 
                   // 备用方法：直接使用h264URL
+                  // 收集全部候选 URL（h264 优先，playURL 兜底），首个 CDN 失败自动切换
+                  NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
                   if (videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-                      NSURL *url = [NSURL URLWithString:videoModel.h264URL.originURLList.firstObject];
-                      [DYYYManager downloadMedia:url
-                                       mediaType:MediaTypeVideo
-                                           audio:audioURL
-                                      completion:^(BOOL success){
-                                      }];
+                      for (NSString *urlString in videoModel.h264URL.originURLList) {
+                          NSURL *url = [NSURL URLWithString:urlString];
+                          if (url) {
+                              [videoURLs addObject:url];
+                          }
+                      }
+                  }
+                  if (videoModel.playURL && videoModel.playURL.originURLList.count > 0) {
+                      for (NSString *urlString in videoModel.playURL.originURLList) {
+                          NSURL *url = [NSURL URLWithString:urlString];
+                          if (url && ![videoURLs containsObject:url]) {
+                              [videoURLs addObject:url];
+                          }
+                      }
+                  }
+
+                  if (videoURLs.count > 0) {
+                      [DYYYManager downloadMediaFromURLs:videoURLs
+                                               mediaType:MediaTypeVideo
+                                                   audio:audioURL
+                                              completion:^(BOOL success){
+                                              }];
+                  } else {
+                      [DYYYUtils showToast:@"没有找到可用的视频地址"];
                   }
               
           
@@ -1139,16 +1193,23 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEVideoModel *videoModel = awemeModel.video;
           if (videoModel && videoModel.coverURL && videoModel.coverURL.originURLList.count > 0) {
-              NSURL *url = [NSURL URLWithString:videoModel.coverURL.originURLList.firstObject];
-              [DYYYManager downloadMedia:url
-                               mediaType:MediaTypeImage
-                                   audio:nil
-                              completion:^(BOOL success) {
-                                if (success) {
-                                } else {
-                                    [DYYYUtils showToast:@"封面保存已取消"];
-                                }
-                              }];
+              // 收集全部候选 URL，首个 CDN 失败自动切换
+              NSMutableArray<NSURL *> *coverURLs = [NSMutableArray array];
+              for (NSString *urlString in videoModel.coverURL.originURLList) {
+                  NSURL *url = [NSURL URLWithString:urlString];
+                  if (url) {
+                      [coverURLs addObject:url];
+                  }
+              }
+              [DYYYManager downloadMediaFromURLs:coverURLs
+                                       mediaType:MediaTypeImage
+                                           audio:nil
+                                      completion:^(BOOL success) {
+                                        if (success) {
+                                        } else {
+                                            [DYYYUtils showToast:@"封面保存已取消"];
+                                        }
+                                      }];
           }
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:nil];
@@ -1167,8 +1228,15 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEMusicModel *musicModel = awemeModel.music;
           if (musicModel && musicModel.playURL && musicModel.playURL.originURLList.count > 0) {
-              NSURL *url = [NSURL URLWithString:musicModel.playURL.originURLList.firstObject];
-              [DYYYManager downloadMedia:url mediaType:MediaTypeAudio audio:nil completion:nil];
+              // 收集全部候选 URL，首个 CDN 失败自动切换
+              NSMutableArray<NSURL *> *audioURLs = [NSMutableArray array];
+              for (NSString *urlString in musicModel.playURL.originURLList) {
+                  NSURL *url = [NSURL URLWithString:urlString];
+                  if (url) {
+                      [audioURLs addObject:url];
+                  }
+              }
+              [DYYYManager downloadMediaFromURLs:audioURLs mediaType:MediaTypeAudio audio:nil completion:nil];
           }
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:nil];
