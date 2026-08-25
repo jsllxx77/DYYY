@@ -3827,13 +3827,19 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 - (void)layoutSubviews {
     %orig;
 
-    self.transform = CGAffineTransformIdentity;
-
     NSString *descriptionOffsetValue = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYDescriptionVerticalOffset"];
     CGFloat verticalOffset = 0;
     if (descriptionOffsetValue.length > 0) {
         verticalOffset = [descriptionOffsetValue floatValue];
     }
+
+    // 仅在用户显式设置了偏移时才干预 transform，其余情况完全透传，
+    // 避免重置抖音自身的布局 transform 导致文章/描述整页跳动
+    if (verticalOffset == 0) {
+        return;
+    }
+
+    self.transform = CGAffineTransformIdentity;
 
     UIView *parentView = self.superview;
     UIView *grandParentView = nil;
@@ -3926,13 +3932,19 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
 - (void)layoutSubviews {
     %orig;
 
-    self.transform = CGAffineTransformIdentity;
-
     NSString *descriptionOffsetValue = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYDescriptionVerticalOffset"];
     CGFloat verticalOffset = 0;
     if (descriptionOffsetValue.length > 0) {
         verticalOffset = [descriptionOffsetValue floatValue];
     }
+
+    // 仅在用户显式设置了偏移时才干预 transform，其余情况完全透传，
+    // 避免重置抖音自身的布局 transform 导致文章/描述整页跳动
+    if (verticalOffset == 0) {
+        return;
+    }
+
+    self.transform = CGAffineTransformIdentity;
 
     UIView *parentView = self.superview;
     UIView *grandParentView = nil;
@@ -3954,14 +3966,20 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
 - (void)layoutSubviews {
     %orig;
 
-    self.transform = CGAffineTransformIdentity;
-
     // 添加垂直偏移支持
     NSString *verticalOffsetValue = [[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYNicknameVerticalOffset"];
     CGFloat verticalOffset = 0;
     if (verticalOffsetValue.length > 0) {
         verticalOffset = [verticalOffsetValue floatValue];
     }
+
+    // 仅在用户显式设置了偏移时才干预 transform，其余情况完全透传，
+    // 避免重置抖音自身的布局 transform 导致昵称/文章容器整页跳动
+    if (verticalOffset == 0) {
+        return;
+    }
+
+    self.transform = CGAffineTransformIdentity;
 
     UIView *parentView = self.superview;
     UIView *grandParentView = nil;
