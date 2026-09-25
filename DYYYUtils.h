@@ -286,8 +286,16 @@ NS_ASSUME_NONNULL_BEGIN
  */
 + (NSComparisonResult)compareVersion:(NSString *)lhs toVersion:(NSString *)rhs;
 
-/** 追加实况下载诊断日志（Documents/DYYY/LivePhotoDiag.txt，500KB 轮转） */
-+ (void)appendDiagLog:(NSString *)log;
+#pragma mark - Download Candidates (下载候选地址)
+
+/** URL 模型（AWEURLModel/URLModel）的全部地址，去重保序；首个 CDN 失败时用作备用 */
++ (NSArray<NSURL *> *)candidateURLsFromURLModel:(nullable id)urlModel;
+
+/** 视频全部候选地址：h264URL → playURL → 各码率 playAddr，去重保序 */
++ (NSArray<NSURL *> *)videoCandidateURLsForVideoModel:(nullable AWEVideoModel *)videoModel;
+
+/** 图集图片 urlList 中非 .image 后缀的地址 */
++ (NSArray<NSURL *> *)imageCandidateURLsFromURLList:(nullable NSArray *)urlList;
 
 @end
 

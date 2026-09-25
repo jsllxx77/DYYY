@@ -900,35 +900,6 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
     }
 }
 
-+ (void)appendDiagLog:(NSString *)log {
-    if (log.length == 0) {
-        return;
-    }
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *documentsDirectory = paths.firstObject;
-    NSString *dyyyFolderPath = [documentsDirectory stringByAppendingPathComponent:@"DYYY"];
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    if (![fileManager fileExistsAtPath:dyyyFolderPath]) {
-        [fileManager createDirectoryAtPath:dyyyFolderPath withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-    NSString *filePath = [dyyyFolderPath stringByAppendingPathComponent:@"LivePhotoDiag.txt"];
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss.SSS"];
-    NSString *line = [NSString stringWithFormat:@"\n===== %@ =====\n%@\n", [formatter stringFromDate:[NSDate date]], log];
-    NSDictionary *attrs = [fileManager attributesOfItemAtPath:filePath error:nil];
-    if (attrs && [attrs[NSFileSize] longLongValue] > 500 * 1024) {
-        [fileManager removeItemAtPath:filePath error:nil];
-    }
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:filePath];
-    if (!fileHandle) {
-        [line writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } else {
-        [fileHandle seekToEndOfFile];
-        [fileHandle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fileHandle closeFile];
-    }
-}
-
 + (BOOL)isDarkMode {
     Class themeManagerClass = NSClassFromString(@"AWEUIThemeManager");
     if (!themeManagerClass) {
@@ -2149,6 +2120,65 @@ static os_unfair_lock _staticColorCreationLock = OS_UNFAIR_LOCK_INIT;
     }
 
     return NSOrderedSame;
+}
+
+#pragma mark - Download Candidates (下载候选地址)
+
+static void DYYYAppendCandidateURLs(NSMutableArray<NSURL *> *candidates, id urlModel) {
+    if (![urlModel respondsToSelector:@selector(originURLList)]) {
+        return;
+    }
+    for (id urlString in [urlModel originURLList]) {
+        if (![urlString isKindOfClass:[NSString class]]) {
+            continue;
+        }
+        NSURL *url = [NSURL URLWithString:urlString];
+        if (url && ![candidates containsObject:url]) {
+            [candidates addObject:url];
+        }
+    }
+}
+
++ (NSArray<NSURL *> *)candidateURLsFromURLModel:(id)urlModel {
+    NSMutableArray<NSURL *> *candidates = [NSMutableArray array];
+    DYYYAppendCandidateURLs(candidates, urlModel);
+    return candidates;
+}
+
++ (NSArray<NSURL *> *)videoCandidateURLsForVideoModel:(AWEVideoModel *)videoModel {
+    NSMutableArray<NSURL *> *candidates = [NSMutableArray array];
+    if (!videoModel) {
+        return candidates;
+    }
+    DYYYAppendCandidateURLs(candidates, videoModel.h264URL);
+    DYYYAppendCandidateURLs(candidates, videoModel.playURL);
+    NSMutableArray *bitrateModels = [NSMutableArray array];
+    if ([videoModel.manualBitrateModels isKindOfClass:[NSArray class]]) {
+        [bitrateModels addObjectsFromArray:videoModel.manualBitrateModels];
+    }
+    if ([videoModel.bitrateModels isKindOfClass:[NSArray class]]) {
+        [bitrateModels addObjectsFromArray:videoModel.bitrateModels];
+    }
+    for (id bitrateModel in bitrateModels) {
+        if ([bitrateModel respondsToSelector:@selector(playAddr)]) {
+            DYYYAppendCandidateURLs(candidates, [bitrateModel playAddr]);
+        }
+    }
+    return candidates;
+}
+
++ (NSArray<NSURL *> *)imageCandidateURLsFromURLList:(NSArray *)urlList {
+    NSMutableArray<NSURL *> *candidates = [NSMutableArray array];
+    for (id urlString in urlList) {
+        if (![urlString isKindOfClass:[NSString class]]) {
+            continue;
+        }
+        NSURL *url = [NSURL URLWithString:urlString];
+        if (url && ![[url.path.lowercaseString pathExtension] isEqualToString:@"image"] && ![candidates containsObject:url]) {
+            [candidates addObject:url];
+        }
+    }
+    return candidates;
 }
 
 #pragma mark - Debug Utilities (调试工具)

@@ -4044,28 +4044,6 @@ static NSString *const kDYYYLongPressCopyEnabledKey = @"DYYYLongPressCopyTextEna
 }
 %end
 
-static void DYYYAppendURLModelCandidates(NSMutableArray<NSURL *> *candidates, AWEURLModel *urlModel) {
-    if (!urlModel || urlModel.originURLList.count == 0) {
-        return;
-    }
-
-    for (NSString *urlString in urlModel.originURLList) {
-        NSURL *url = [NSURL URLWithString:urlString];
-        if (url) {
-            [candidates addObject:url];
-        }
-    }
-}
-
-static void DYYYAppendBitrateCandidates(NSMutableArray<NSURL *> *candidates, NSArray *bitrateModels) {
-    for (id bitrateModel in bitrateModels) {
-        AWEURLModel *playAddress = [bitrateModel valueForKey:@"playAddr"];
-        if ([playAddress isKindOfClass:%c(AWEURLModel)]) {
-            DYYYAppendURLModelCandidates(candidates, playAddress);
-        }
-    }
-}
-
 // 获取资源的地址
 %hook AWEURLModel
 %new - (NSURL *)getDYYYSrcURLDownload {
@@ -9143,26 +9121,21 @@ static NSHashTable *processedParentViews = nil;
                                   currentImageModel = awemeModel.albumImages.firstObject;
                               }
 
-                              // 查找非.image后缀的URL
-                              NSURL *downloadURL = nil;
-                              for (NSString *urlString in currentImageModel.urlList) {
-                                  NSURL *url = [NSURL URLWithString:urlString];
-                                  NSString *pathExtension = [url.path.lowercaseString pathExtension];
-                                  if (![pathExtension isEqualToString:@"image"]) {
-                                      downloadURL = url;
-                                      break;
-                                  }
-                              }
+                              // 非 .image 后缀的全部候选 URL，首个 CDN 失败自动切换
+                              NSArray<NSURL *> *imageURLs = [DYYYUtils imageCandidateURLsFromURLList:currentImageModel.urlList];
 
                               if (currentImageModel.clipVideo != nil) {
-                                  NSURL *videoURL = [currentImageModel.clipVideo.playURL getDYYYSrcURLDownload];
-                                  [DYYYManager downloadLivePhoto:downloadURL
-                                                        videoURL:videoURL
-                                                      completion:^{
-                                                      }];
+                                  // 优先 video_mp4 地址，其余作备用
+                                  NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
+                                  NSURL *preferredVideoURL = [currentImageModel.clipVideo.playURL getDYYYSrcURLDownload];
+                                  if (preferredVideoURL) {
+                                      [videoURLs addObject:preferredVideoURL];
+                                  }
+                                  [videoURLs addObjectsFromArray:[DYYYUtils candidateURLsFromURLModel:currentImageModel.clipVideo.playURL]];
+                                  [DYYYManager downloadLivePhotoFromImageURLs:imageURLs videoURLs:videoURLs completion:nil];
                               } else if (currentImageModel && currentImageModel.urlList.count > 0) {
-                                  if (downloadURL) {
-                                      [DYYYManager downloadMedia:downloadURL
+                                  if (imageURLs.count > 0) {
+                                      [DYYYManager downloadMediaFromURLs:imageURLs
                                                        mediaType:MediaTypeImage
                                                            audio:nil
                                                       completion:^(BOOL success) {
@@ -9177,33 +9150,12 @@ static NSHashTable *processedParentViews = nil;
                               }
                           } else if (isNewLivePhoto) {
                               // 新版实况照片
-                              // 使用封面URL作为图片URL
-                              NSURL *imageURL = nil;
-                              if (videoModel.coverURL && videoModel.coverURL.originURLList.count > 0) {
-                                  imageURL = [NSURL URLWithString:videoModel.coverURL.originURLList.firstObject];
-                              }
-
-                              // 视频URL从视频模型获取
-                              NSURL *videoURL = nil;
-                              if (videoModel && videoModel.playURL && videoModel.playURL.originURLList.count > 0) {
-                                  videoURL = [NSURL URLWithString:videoModel.playURL.originURLList.firstObject];
-                              } else if (videoModel && videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-                                  videoURL = [NSURL URLWithString:videoModel.h264URL.originURLList.firstObject];
-                              }
-
-                              // 下载实况照片
-                              if (imageURL && videoURL) {
-                                  [DYYYManager downloadLivePhoto:imageURL
-                                                        videoURL:videoURL
-                                                      completion:^{
-                                                      }];
-                              }
+                              // 封面作图片，视频优先 playURL；均收集全部候选 URL，首个 CDN 失败自动切换
+                              NSArray<NSURL *> *imageURLs = [DYYYUtils candidateURLsFromURLModel:videoModel.coverURL];
+                              NSArray<NSURL *> *videoURLs = [[DYYYUtils candidateURLsFromURLModel:videoModel.playURL] arrayByAddingObjectsFromArray:[DYYYUtils videoCandidateURLsForVideoModel:videoModel]];
+                              [DYYYManager downloadLivePhotoFromImageURLs:imageURLs videoURLs:videoURLs completion:nil];
                           } else {
-                              NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
-                              DYYYAppendURLModelCandidates(videoURLs, (AWEURLModel *)videoModel.h264URL);
-                              DYYYAppendURLModelCandidates(videoURLs, videoModel.playURL);
-                              DYYYAppendBitrateCandidates(videoURLs, videoModel.manualBitrateModels);
-                              DYYYAppendBitrateCandidates(videoURLs, videoModel.bitrateModels);
+                              NSArray<NSURL *> *videoURLs = [DYYYUtils videoCandidateURLsForVideoModel:videoModel];
 
                               if (videoURLs.count > 0) {
                                   [DYYYManager downloadMediaFromURLs:videoURLs
@@ -9289,14 +9241,8 @@ static NSHashTable *processedParentViews = nil;
                                                                                                         imgName:nil
                                                                                                         handler:^{
                                                                                                           if (musicModel && musicModel.playURL && musicModel.playURL.originURLList.count > 0) {
-                                                                                                              // 收集全部候选 URL，首个 CDN 失败自动切换
-                                                                                                              NSMutableArray<NSURL *> *audioURLs = [NSMutableArray array];
-                                                                                                              for (NSString *urlString in musicModel.playURL.originURLList) {
-                                                                                                                  NSURL *url = [NSURL URLWithString:urlString];
-                                                                                                                  if (url) {
-                                                                                                                      [audioURLs addObject:url];
-                                                                                                                  }
-                                                                                                              }
+                                                                                                              // 全部候选 URL，首个 CDN 失败自动切换
+                                                                                                              NSArray<NSURL *> *audioURLs = [DYYYUtils candidateURLsFromURLModel:musicModel.playURL];
                                                                                                               [DYYYManager downloadMediaFromURLs:audioURLs mediaType:MediaTypeAudio audio:nil completion:nil];
                                                                                                           }
                                                                                                         }];

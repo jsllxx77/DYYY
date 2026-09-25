@@ -211,7 +211,47 @@
     }];
 }
 
-+ (void)downloadLivePhoto:(NSURL *)imageURL videoURL:(NSURL *)videoURL completion:(void (^)(void))completion {
+// 依次尝试候选地址，首个成功（2xx 且写入成功）即止
+static void DYYYDownloadFirstAvailableURL(NSURLSession *session, NSArray<NSURL *> *urls, NSUInteger index, NSString *path, void (^completion)(BOOL success)) {
+    if (index >= urls.count) {
+        completion(NO);
+        return;
+    }
+    NSURLSessionDataTask *task = [session dataTaskWithURL:urls[index]
+                                        completionHandler:^(NSData *_Nullable data, NSURLResponse *_Nullable response, NSError *_Nullable error) {
+                                          NSInteger statusCode = [response isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)response statusCode] : 200;
+                                          if (!error && data.length > 0 && statusCode >= 200 && statusCode < 300 && [data writeToFile:path atomically:YES]) {
+                                              completion(YES);
+                                              return;
+                                          }
+                                          NSLog(@"[DYYY] 实况地址失败，切换备用地址: %@", error.localizedDescription ?: @(statusCode));
+                                          DYYYDownloadFirstAvailableURL(session, urls, index + 1, path, completion);
+                                        }];
+    [task resume];
+}
+
+static NSArray<NSURL *> *DYYYUniqueURLs(NSArray *urls) {
+    NSMutableArray<NSURL *> *result = [NSMutableArray array];
+    for (id url in urls) {
+        if ([url isKindOfClass:[NSURL class]] && [(NSURL *)url absoluteString].length > 0 && ![result containsObject:url]) {
+            [result addObject:url];
+        }
+    }
+    return result;
+}
+
++ (void)downloadLivePhotoFromImageURLs:(NSArray<NSURL *> *)imageURLs videoURLs:(NSArray<NSURL *> *)videoURLs completion:(void (^)(void))completion {
+    imageURLs = DYYYUniqueURLs(imageURLs);
+    videoURLs = DYYYUniqueURLs(videoURLs);
+    if (imageURLs.count == 0 || videoURLs.count == 0) {
+        [DYYYUtils showToast:@"没有找到可用的实况地址"];
+        if (completion) {
+            completion();
+        }
+        return;
+    }
+    NSURL *imageURL = imageURLs.firstObject;
+    NSURL *videoURL = videoURLs.firstObject;
     // 获取共享实例，确保FileLinks字典存在
     DYYYManager *manager = [DYYYManager shared];
     if (!manager.fileLinks) {
@@ -241,17 +281,17 @@
                 return;
             } else {
                 // 文件不完整，需要重新下载
-                [self startDownloadLivePhotoProcess:imageURL videoURL:videoURL uniqueKey:uniqueKey completion:completion];
+                [self startDownloadLivePhotoProcess:imageURLs videoURLs:videoURLs uniqueKey:uniqueKey completion:completion];
             }
           });
         });
     } else {
         // 没有缓存，直接开始下载
-        [self startDownloadLivePhotoProcess:imageURL videoURL:videoURL uniqueKey:uniqueKey completion:completion];
+        [self startDownloadLivePhotoProcess:imageURLs videoURLs:videoURLs uniqueKey:uniqueKey completion:completion];
     }
 }
 
-+ (void)startDownloadLivePhotoProcess:(NSURL *)imageURL videoURL:(NSURL *)videoURL uniqueKey:(NSString *)uniqueKey completion:(void (^)(void))completion {
++ (void)startDownloadLivePhotoProcess:(NSArray<NSURL *> *)imageURLs videoURLs:(NSArray<NSURL *> *)videoURLs uniqueKey:(NSString *)uniqueKey completion:(void (^)(void))completion {
     // 创建临时目录
     NSString *livePhotoPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"LivePhoto"];
 
@@ -291,10 +331,6 @@
       __block float imageProgress = 0.0;
       __block float videoProgress = 0.0;
 
-      // 设置单独的下载观察者ID用于进度跟踪
-      NSString *imageDownloadID = [NSString stringWithFormat:@"image_%@", uniqueID];
-      NSString *videoDownloadID = [NSString stringWithFormat:@"video_%@", uniqueID];
-
       // 更新合并进度的定时器
       __weak DYYYToast *weakProgressView = progressView;
       __block NSTimer *progressTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
@@ -319,59 +355,24 @@
                                                                            }
                                                                         }];
 
-      // 下载图片
+      // 下载图片与视频，各自在候选地址间失败切换
       dispatch_group_enter(group);
-      NSURLRequest *imageRequest = [NSURLRequest requestWithURL:imageURL];
-      NSURLSessionDataTask *imageTask = [session dataTaskWithRequest:imageRequest
-                                                   completionHandler:^(NSData *_Nullable data, NSURLResponse *_Nullable response, NSError *_Nullable error) {
-                                                     if (!error && data) {
-                                                         // 直接写入文件，避免临时文件移动操作
-                                                         if ([data writeToFile:imagePath atomically:YES]) {
-                                                             imageDownloaded = YES;
-                                                             imageProgress = 1.0;
-                                                         }
-                                                     }
-                                                     dispatch_group_leave(group);
-                                                   }];
+      DYYYDownloadFirstAvailableURL(session, imageURLs, 0, imagePath, ^(BOOL success) {
+        if (success) {
+            imageDownloaded = YES;
+            imageProgress = 1.0;
+        }
+        dispatch_group_leave(group);
+      });
 
-      // 设置图片下载进度观察
-      if ([imageTask respondsToSelector:@selector(taskIdentifier)]) {
-          [[manager taskProgressMap] setObject:@(0.0) forKey:imageDownloadID];
-
-          // 使用系统API观察进度 (iOS 11+)
-          if (@available(iOS 11.0, *)) {
-              [imageTask.progress addObserver:manager forKeyPath:@"fractionCompleted" options:NSKeyValueObservingOptionNew context:(__bridge void *)(imageDownloadID)];
-          }
-      }
-
-      // 下载视频
       dispatch_group_enter(group);
-      NSURLRequest *videoRequest = [NSURLRequest requestWithURL:videoURL];
-      NSURLSessionDataTask *videoTask = [session dataTaskWithRequest:videoRequest
-                                                   completionHandler:^(NSData *_Nullable data, NSURLResponse *_Nullable response, NSError *_Nullable error) {
-                                                     if (!error && data) {
-                                                         // 直接写入文件，避免临时文件移动操作
-                                                         if ([data writeToFile:videoPath atomically:YES]) {
-                                                             videoDownloaded = YES;
-                                                             videoProgress = 1.0;
-                                                         }
-                                                     }
-                                                     dispatch_group_leave(group);
-                                                   }];
-
-      // 设置视频下载进度观察
-      if ([videoTask respondsToSelector:@selector(taskIdentifier)]) {
-          [[manager taskProgressMap] setObject:@(0.0) forKey:videoDownloadID];
-
-          // 使用系统API观察进度 (iOS 11+)
-          if (@available(iOS 11.0, *)) {
-              [videoTask.progress addObserver:manager forKeyPath:@"fractionCompleted" options:NSKeyValueObservingOptionNew context:(__bridge void *)(videoDownloadID)];
-          }
-      }
-
-      // 启动下载任务
-      [imageTask resume];
-      [videoTask resume];
+      DYYYDownloadFirstAvailableURL(session, videoURLs, 0, videoPath, ^(BOOL success) {
+        if (success) {
+            videoDownloaded = YES;
+            videoProgress = 1.0;
+        }
+        dispatch_group_leave(group);
+      });
 
       // 当两个下载都完成后，保存实况照片
       dispatch_group_notify(group, dispatch_get_main_queue(), ^{
@@ -381,28 +382,9 @@
             progressTimer = nil;
         }
 
-        // 移除进度观察
-        if (@available(iOS 11.0, *)) {
-            if ([imageTask respondsToSelector:@selector(progress)]) {
-                [imageTask.progress removeObserver:manager forKeyPath:@"fractionCompleted"];
-            }
-            if ([videoTask respondsToSelector:@selector(progress)]) {
-                [videoTask.progress removeObserver:manager forKeyPath:@"fractionCompleted"];
-            }
-        }
-
         // 检查文件是否真的存在
         BOOL imageExists = [[NSFileManager defaultManager] fileExistsAtPath:imagePath];
         BOOL videoExists = [[NSFileManager defaultManager] fileExistsAtPath:videoPath];
-
-        // 实况下载结果诊断（build.16）
-        [DYYYUtils appendDiagLog:[NSString stringWithFormat:@"downloadLivePhoto result: image=%@(%@) video=%@(%@) imageSize=%lld videoSize=%lld",
-                                                            imageExists ? @"OK" : @"FAIL",
-                                                            imageURL ? imageURL.absoluteString : @"(nil)",
-                                                            videoExists ? @"OK" : @"FAIL",
-                                                            videoURL ? videoURL.absoluteString : @"(nil)",
-                                                            imageExists ? [[[NSFileManager defaultManager] attributesOfItemAtPath:imagePath error:nil][NSFileSize] longLongValue] : -1,
-                                                            videoExists ? [[[NSFileManager defaultManager] attributesOfItemAtPath:videoPath error:nil][NSFileSize] longLongValue] : -1]];
 
         BOOL downloadSucceeded = imageExists && videoExists;
         progressView.allowSuccessAnimation = downloadSucceeded;
@@ -415,7 +397,6 @@
                     [[DYYYManager shared] saveLivePhoto:imagePath videoUrl:videoPath];
                 }
             } @catch (NSException *exception) {
-                [DYYYUtils appendDiagLog:[NSString stringWithFormat:@"saveLivePhoto exception: %@\n%@", exception, exception.callStackSymbols]];
                 // 删除失败的文件
                 [[NSFileManager defaultManager] removeItemAtPath:imagePath error:nil];
                 [[NSFileManager defaultManager] removeItemAtPath:videoPath error:nil];
@@ -423,7 +404,6 @@
                 [DYYYUtils showToast:@"保存实况照片失败"];
             }
         } else {
-            [DYYYUtils appendDiagLog:@"download failed -> 清理不完整文件"];
             // 清理不完整的文件
             if (imageExists)
                 [[NSFileManager defaultManager] removeItemAtPath:imagePath error:nil];
@@ -474,7 +454,7 @@
     }
 
     if (validURLs.count == 0) {
-        [DYYYUtils showToast:@"没有找到可用的视频地址"];
+        [DYYYUtils showToast:@"没有找到可用的下载地址"];
         if (completion) {
             completion(NO);
         }
@@ -1178,8 +1158,6 @@
                                     [[NSFileManager defaultManager] removeItemAtPath:videoSourcePath error:nil];
                                     [[NSFileManager defaultManager] removeItemAtPath:photoFile error:nil];
                                     [[NSFileManager defaultManager] removeItemAtPath:videoFile error:nil];
-                                } else {
-                                    [DYYYUtils appendDiagLog:[NSString stringWithFormat:@"PHAssetCreationRequest FAILED: %@\nphoto=%@\nvideo=%@", error ? error.localizedDescription : @"(nil)", photo, video]];
                                 }
                               });
                             }];

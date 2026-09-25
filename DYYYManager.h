@@ -75,11 +75,11 @@
 
 /**
  * 下载实况照片
- * @param imageURL 图片URL
- * @param videoURL 视频URL
+ * @param imageURLs 图片候选URL（首个失败自动切换下一个）
+ * @param videoURLs 视频候选URL（首个失败自动切换下一个）
  * @param completion 完成回调
  */
-+ (void)downloadLivePhoto:(NSURL *)imageURL videoURL:(NSURL *)videoURL completion:(void (^)(void))completion;
++ (void)downloadLivePhotoFromImageURLs:(NSArray<NSURL *> *)imageURLs videoURLs:(NSArray<NSURL *> *)videoURLs completion:(void (^)(void))completion;
 
 /**
  * 批量下载实况照片

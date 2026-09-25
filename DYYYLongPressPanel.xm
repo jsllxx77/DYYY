@@ -144,24 +144,8 @@
               audioURL = [NSURL URLWithString:musicModel.playURL.originURLList.firstObject];
           }
 
-                  // 收集全部候选 URL（h264 优先，playURL 兜底），首个 CDN 失败自动切换
-                  NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
-                  if (videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-                      for (NSString *urlString in videoModel.h264URL.originURLList) {
-                          NSURL *url = [NSURL URLWithString:urlString];
-                          if (url) {
-                              [videoURLs addObject:url];
-                          }
-                      }
-                  }
-                  if (videoModel.playURL && videoModel.playURL.originURLList.count > 0) {
-                      for (NSString *urlString in videoModel.playURL.originURLList) {
-                          NSURL *url = [NSURL URLWithString:urlString];
-                          if (url && ![videoURLs containsObject:url]) {
-                              [videoURLs addObject:url];
-                          }
-                      }
-                  }
+                  // 收集全部候选 URL（h264 → playURL → 各码率），首个 CDN 失败自动切换
+                  NSArray<NSURL *> *videoURLs = [DYYYUtils videoCandidateURLsForVideoModel:videoModel];
 
                   if (videoURLs.count > 0) {
                       [DYYYManager downloadMediaFromURLs:videoURLs
@@ -191,27 +175,10 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEVideoModel *videoModel = awemeModel.video;
 
-          // 使用封面URL作为图片URL
-          NSURL *imageURL = nil;
-          if (videoModel.coverURL && videoModel.coverURL.originURLList.count > 0) {
-              imageURL = [NSURL URLWithString:videoModel.coverURL.originURLList.firstObject];
-          }
-
-          // 视频URL从视频模型获取
-          NSURL *videoURL = nil;
-          if (videoModel && videoModel.playURL && videoModel.playURL.originURLList.count > 0) {
-              videoURL = [NSURL URLWithString:videoModel.playURL.originURLList.firstObject];
-          } else if (videoModel && videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-              videoURL = [NSURL URLWithString:videoModel.h264URL.originURLList.firstObject];
-          }
-
-          // 下载实况照片
-          if (imageURL && videoURL) {
-              [DYYYManager downloadLivePhoto:imageURL
-                                    videoURL:videoURL
-                                  completion:^{
-                                  }];
-          }
+          // 封面作图片，视频优先 playURL；均收集全部候选 URL，首个 CDN 失败自动切换
+          NSArray<NSURL *> *imageURLs = [DYYYUtils candidateURLsFromURLModel:videoModel.coverURL];
+          NSArray<NSURL *> *videoURLs = [[DYYYUtils candidateURLsFromURLModel:videoModel.playURL] arrayByAddingObjectsFromArray:[DYYYUtils videoCandidateURLsForVideoModel:videoModel]];
+          [DYYYManager downloadLivePhotoFromImageURLs:imageURLs videoURLs:videoURLs completion:nil];
 
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:nil];
@@ -248,42 +215,22 @@
           } else {
               currentImageModel = awemeModel.albumImages.firstObject;
           }
-          // 实况下载诊断：记录模型状态与 URL 选取过程（build.16）
-          NSMutableString *diag = [NSMutableString string];
-          [diag appendFormat:@"awemeType=%ld count=%ld idx=%ld isLivePhoto=%d clipVideo=%@\n", (long)awemeModel.awemeType, (long)awemeModel.albumImages.count, (long)awemeModel.currentImageIndex, awemeModel.isLivePhoto ? 1 : 0, currentImageModel.clipVideo ? @"YES" : @"nil"];
-          for (NSString *u in currentImageModel.urlList) {
-              [diag appendFormat:@"urlList: %@\n", u];
-          }
-          if (currentImageModel.clipVideo) {
-              [diag appendFormat:@"clipVideo.playURL=%@\n", currentImageModel.clipVideo.playURL];
-              for (NSString *u in currentImageModel.clipVideo.playURL.originURLList) {
-                  [diag appendFormat:@"playURL.origin: %@\n", u];
-              }
-          }
-          // 查找非.image后缀的URL
-          NSURL *downloadURL = nil;
-          for (NSString *urlString in currentImageModel.urlList) {
-              NSURL *url = [NSURL URLWithString:urlString];
-              NSString *pathExtension = [url.path.lowercaseString pathExtension];
-              if (![pathExtension isEqualToString:@"image"]) {
-                  downloadURL = url;
-                  break;
-              }
-          }
-          [diag appendFormat:@"selected downloadURL=%@\n", downloadURL ? downloadURL.absoluteString : @"(nil)"];
+          // 如果是实况的话
+          // 非 .image 后缀的全部候选 URL，首个 CDN 失败自动切换
+          NSArray<NSURL *> *imageURLs = [DYYYUtils imageCandidateURLsFromURLList:currentImageModel.urlList];
 
           if (currentImageModel.clipVideo != nil) {
-              NSURL *videoURL = [currentImageModel.clipVideo.playURL getDYYYSrcURLDownload];
-              [diag appendFormat:@"selected videoURL=%@\n", videoURL ? videoURL.absoluteString : @"(nil)"];
-              [DYYYUtils appendDiagLog:diag];
-              [DYYYManager downloadLivePhoto:downloadURL
-                                    videoURL:videoURL
-                                  completion:^{
-                                  }];
+              // 优先 video_mp4 地址，其余作备用
+              NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
+              NSURL *preferredVideoURL = [currentImageModel.clipVideo.playURL getDYYYSrcURLDownload];
+              if (preferredVideoURL) {
+                  [videoURLs addObject:preferredVideoURL];
+              }
+              [videoURLs addObjectsFromArray:[DYYYUtils candidateURLsFromURLModel:currentImageModel.clipVideo.playURL]];
+              [DYYYManager downloadLivePhotoFromImageURLs:imageURLs videoURLs:videoURLs completion:nil];
           } else if (currentImageModel && currentImageModel.urlList.count > 0) {
-              [DYYYUtils appendDiagLog:diag];
-              if (downloadURL) {
-                  [DYYYManager downloadMedia:downloadURL
+              if (imageURLs.count > 0) {
+                  [DYYYManager downloadMediaFromURLs:imageURLs
                                    mediaType:MediaTypeImage
                                        audio:nil
                                   completion:^(BOOL success) {
@@ -404,14 +351,8 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEVideoModel *videoModel = awemeModel.video;
           if (videoModel && videoModel.coverURL && videoModel.coverURL.originURLList.count > 0) {
-              // 收集全部候选 URL，首个 CDN 失败自动切换
-              NSMutableArray<NSURL *> *coverURLs = [NSMutableArray array];
-              for (NSString *urlString in videoModel.coverURL.originURLList) {
-                  NSURL *url = [NSURL URLWithString:urlString];
-                  if (url) {
-                      [coverURLs addObject:url];
-                  }
-              }
+              // 全部候选 URL，首个 CDN 失败自动切换
+              NSArray<NSURL *> *coverURLs = [DYYYUtils candidateURLsFromURLModel:videoModel.coverURL];
               [DYYYManager downloadMediaFromURLs:coverURLs
                                        mediaType:MediaTypeImage
                                            audio:nil
@@ -439,14 +380,8 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEMusicModel *musicModel = awemeModel.music;
           if (musicModel && musicModel.playURL && musicModel.playURL.originURLList.count > 0) {
-              // 收集全部候选 URL，首个 CDN 失败自动切换
-              NSMutableArray<NSURL *> *audioURLs = [NSMutableArray array];
-              for (NSString *urlString in musicModel.playURL.originURLList) {
-                  NSURL *url = [NSURL URLWithString:urlString];
-                  if (url) {
-                      [audioURLs addObject:url];
-                  }
-              }
+              // 全部候选 URL，首个 CDN 失败自动切换
+              NSArray<NSURL *> *audioURLs = [DYYYUtils candidateURLsFromURLModel:musicModel.playURL];
               [DYYYManager downloadMediaFromURLs:audioURLs mediaType:MediaTypeAudio audio:nil completion:nil];
           }
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
@@ -962,24 +897,8 @@
           }
 
                   // 备用方法：直接使用h264URL
-                  // 收集全部候选 URL（h264 优先，playURL 兜底），首个 CDN 失败自动切换
-                  NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
-                  if (videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-                      for (NSString *urlString in videoModel.h264URL.originURLList) {
-                          NSURL *url = [NSURL URLWithString:urlString];
-                          if (url) {
-                              [videoURLs addObject:url];
-                          }
-                      }
-                  }
-                  if (videoModel.playURL && videoModel.playURL.originURLList.count > 0) {
-                      for (NSString *urlString in videoModel.playURL.originURLList) {
-                          NSURL *url = [NSURL URLWithString:urlString];
-                          if (url && ![videoURLs containsObject:url]) {
-                              [videoURLs addObject:url];
-                          }
-                      }
-                  }
+                  // 收集全部候选 URL（h264 → playURL → 各码率），首个 CDN 失败自动切换
+                  NSArray<NSURL *> *videoURLs = [DYYYUtils videoCandidateURLsForVideoModel:videoModel];
 
                   if (videoURLs.count > 0) {
                       [DYYYManager downloadMediaFromURLs:videoURLs
@@ -1009,27 +928,10 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEVideoModel *videoModel = awemeModel.video;
 
-          // 使用封面URL作为图片URL
-          NSURL *imageURL = nil;
-          if (videoModel.coverURL && videoModel.coverURL.originURLList.count > 0) {
-              imageURL = [NSURL URLWithString:videoModel.coverURL.originURLList.firstObject];
-          }
-
-          // 视频URL从视频模型获取
-          NSURL *videoURL = nil;
-          if (videoModel && videoModel.playURL && videoModel.playURL.originURLList.count > 0) {
-              videoURL = [NSURL URLWithString:videoModel.playURL.originURLList.firstObject];
-          } else if (videoModel && videoModel.h264URL && videoModel.h264URL.originURLList.count > 0) {
-              videoURL = [NSURL URLWithString:videoModel.h264URL.originURLList.firstObject];
-          }
-
-          // 下载实况照片
-          if (imageURL && videoURL) {
-              [DYYYManager downloadLivePhoto:imageURL
-                                    videoURL:videoURL
-                                  completion:^{
-                                  }];
-          }
+          // 封面作图片，视频优先 playURL；均收集全部候选 URL，首个 CDN 失败自动切换
+          NSArray<NSURL *> *imageURLs = [DYYYUtils candidateURLsFromURLModel:videoModel.coverURL];
+          NSArray<NSURL *> *videoURLs = [[DYYYUtils candidateURLsFromURLModel:videoModel.playURL] arrayByAddingObjectsFromArray:[DYYYUtils videoCandidateURLsForVideoModel:videoModel]];
+          [DYYYManager downloadLivePhotoFromImageURLs:imageURLs videoURLs:videoURLs completion:nil];
 
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
           [panelManager dismissWithAnimation:YES completion:nil];
@@ -1067,42 +969,22 @@
           } else {
               currentImageModel = awemeModel.albumImages.firstObject;
           }
-          // 实况下载诊断：记录模型状态与 URL 选取过程（build.16）
-          NSMutableString *diag = [NSMutableString string];
-          [diag appendFormat:@"awemeType=%ld count=%ld idx=%ld isLivePhoto=%d clipVideo=%@\n", (long)awemeModel.awemeType, (long)awemeModel.albumImages.count, (long)awemeModel.currentImageIndex, awemeModel.isLivePhoto ? 1 : 0, currentImageModel.clipVideo ? @"YES" : @"nil"];
-          for (NSString *u in currentImageModel.urlList) {
-              [diag appendFormat:@"urlList: %@\n", u];
-          }
-          if (currentImageModel.clipVideo) {
-              [diag appendFormat:@"clipVideo.playURL=%@\n", currentImageModel.clipVideo.playURL];
-              for (NSString *u in currentImageModel.clipVideo.playURL.originURLList) {
-                  [diag appendFormat:@"playURL.origin: %@\n", u];
-              }
-          }
-          // 查找非.image后缀的URL
-          NSURL *downloadURL = nil;
-          for (NSString *urlString in currentImageModel.urlList) {
-              NSURL *url = [NSURL URLWithString:urlString];
-              NSString *pathExtension = [url.path.lowercaseString pathExtension];
-              if (![pathExtension isEqualToString:@"image"]) {
-                  downloadURL = url;
-                  break;
-              }
-          }
-          [diag appendFormat:@"selected downloadURL=%@\n", downloadURL ? downloadURL.absoluteString : @"(nil)"];
+          // 如果是实况的话
+          // 非 .image 后缀的全部候选 URL，首个 CDN 失败自动切换
+          NSArray<NSURL *> *imageURLs = [DYYYUtils imageCandidateURLsFromURLList:currentImageModel.urlList];
 
           if (currentImageModel.clipVideo != nil) {
-              NSURL *videoURL = [currentImageModel.clipVideo.playURL getDYYYSrcURLDownload];
-              [diag appendFormat:@"selected videoURL=%@\n", videoURL ? videoURL.absoluteString : @"(nil)"];
-              [DYYYUtils appendDiagLog:diag];
-              [DYYYManager downloadLivePhoto:downloadURL
-                                    videoURL:videoURL
-                                  completion:^{
-                                  }];
+              // 优先 video_mp4 地址，其余作备用
+              NSMutableArray<NSURL *> *videoURLs = [NSMutableArray array];
+              NSURL *preferredVideoURL = [currentImageModel.clipVideo.playURL getDYYYSrcURLDownload];
+              if (preferredVideoURL) {
+                  [videoURLs addObject:preferredVideoURL];
+              }
+              [videoURLs addObjectsFromArray:[DYYYUtils candidateURLsFromURLModel:currentImageModel.clipVideo.playURL]];
+              [DYYYManager downloadLivePhotoFromImageURLs:imageURLs videoURLs:videoURLs completion:nil];
           } else if (currentImageModel && currentImageModel.urlList.count > 0) {
-              [DYYYUtils appendDiagLog:diag];
-              if (downloadURL) {
-                  [DYYYManager downloadMedia:downloadURL
+              if (imageURLs.count > 0) {
+                  [DYYYManager downloadMediaFromURLs:imageURLs
                                    mediaType:MediaTypeImage
                                        audio:nil
                                   completion:^(BOOL success) {
@@ -1223,14 +1105,8 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEVideoModel *videoModel = awemeModel.video;
           if (videoModel && videoModel.coverURL && videoModel.coverURL.originURLList.count > 0) {
-              // 收集全部候选 URL，首个 CDN 失败自动切换
-              NSMutableArray<NSURL *> *coverURLs = [NSMutableArray array];
-              for (NSString *urlString in videoModel.coverURL.originURLList) {
-                  NSURL *url = [NSURL URLWithString:urlString];
-                  if (url) {
-                      [coverURLs addObject:url];
-                  }
-              }
+              // 全部候选 URL，首个 CDN 失败自动切换
+              NSArray<NSURL *> *coverURLs = [DYYYUtils candidateURLsFromURLModel:videoModel.coverURL];
               [DYYYManager downloadMediaFromURLs:coverURLs
                                        mediaType:MediaTypeImage
                                            audio:nil
@@ -1258,14 +1134,8 @@
           AWEAwemeModel *awemeModel = self.awemeModel;
           AWEMusicModel *musicModel = awemeModel.music;
           if (musicModel && musicModel.playURL && musicModel.playURL.originURLList.count > 0) {
-              // 收集全部候选 URL，首个 CDN 失败自动切换
-              NSMutableArray<NSURL *> *audioURLs = [NSMutableArray array];
-              for (NSString *urlString in musicModel.playURL.originURLList) {
-                  NSURL *url = [NSURL URLWithString:urlString];
-                  if (url) {
-                      [audioURLs addObject:url];
-                  }
-              }
+              // 全部候选 URL，首个 CDN 失败自动切换
+              NSArray<NSURL *> *audioURLs = [DYYYUtils candidateURLsFromURLModel:musicModel.playURL];
               [DYYYManager downloadMediaFromURLs:audioURLs mediaType:MediaTypeAudio audio:nil completion:nil];
           }
           AWELongPressPanelManager *panelManager = [%c(AWELongPressPanelManager) shareInstance];
